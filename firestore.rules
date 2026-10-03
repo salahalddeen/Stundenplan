@@ -1,0 +1,17 @@
+rules_version = '2';
+// Stundenplan-Optimierer: Jedes Konto darf nur seine eigenen Dokumente unter users/{eigene ID}/docs lesen und schreiben.
+// Alles andere ist gesperrt. In Firebase: Firestore Database → Regeln → alles ersetzen → Veröffentlichen.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /users/{uid}/docs/{docId} {
+      allow read, delete: if request.auth != null && request.auth.uid == uid;
+      allow create, update: if request.auth != null && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['kind', 'data', 'deleted', 'client_ts'])
+        && request.resource.data.kind in ['workspace', 'plan']
+        && request.resource.data.data is string
+        && request.resource.data.data.size() < 900000
+        && request.resource.data.deleted is bool
+        && request.resource.data.client_ts is int;
+    }
+  }
+}
