@@ -10,7 +10,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-<script>window.SPO_VERSION = {"name": "1.2", "build": "0625edd898", "date": "19.10.2026 23:25"};</script>
+<script>window.SPO_VERSION = {"name": "1.4", "build": "f28ae3cb93", "date": "20.10.2026 00:23"};</script>
 <script src="config.js"></script>
 <title>Stundenplan-Optimierer</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -1624,8 +1624,9 @@ const Cloud = (() => {
   let session = ls.get(LS_SESSION, null);
   const user = () => session && session.uid ? { id: session.uid, email: session.email } : null;
   const signedIn = () => !!(session && session.idToken);
-  function keep(s) { session = { ...(session || {}), ...s }; ls.set(LS_SESSION, session); }
-  function forget() { session = null; ls.del(LS_SESSION); }
+  function keep(s) {
+    const before = session && session.uid; session = { ...(session || {}), ...s }; ls.set(LS_SESSION, session); if (session.uid !== before && typeof reloadMeta === 'function') reloadMeta(); }
+  function forget() { session = null; ls.del(LS_SESSION); if (typeof reloadMeta === 'function') reloadMeta(); }
 
   class CloudError extends Error { constructor(msg, kind, status) { super(msg); this.kind = kind; this.status = status; } }
   const errText = (j, status) => {
@@ -1682,7 +1683,7 @@ const Cloud = (() => {
     fromAuth(await call(`${AUTH}/accounts:signInWithPassword?key=${config().apiKey}`, { method: 'POST', body: { email, password, returnSecureToken: true } }));
     return user();
   }
-  async function signOut() { forget(); ls.del(LS_META); }
+  async function signOut() { ls.del(bkKey()); ls.del(metaKey()); forget(); meta = {}; }
   /** Firebase schickt eine Mail mit Link zu einer Firebase-Seite, auf der man ein neues Passwort festlegt */
   async function recover(email) { await call(`${AUTH}/accounts:sendOobCode?key=${config().apiKey}`, { method: 'POST', body: { requestType: 'PASSWORD_RESET', email } }); }
 
@@ -1715,17 +1716,24 @@ const Cloud = (() => {
 
   /* ---------- Dokumente ---------- */
   // meta[id] = { seen: updated_at vom Server beim letzten Abgleich, dirty: lokal geändert seit dem Abgleich, at: lokale Änderungszeit }
-  let meta = ls.get(LS_META, {});
-  const saveMeta = () => ls.set(LS_META, meta);
+  // Abgleich-Stand gehört zum jeweiligen Konto (eigener Schlüssel je Konto)
+  const metaKey = () => LS_META + (session && session.uid ? ':' + session.uid : '');
+  if (session && session.uid && !ls.get(metaKey(), null) && ls.get(LS_META, null)) { ls.set(metaKey(), ls.get(LS_META, {})); ls.del(LS_META); } // Umstellung von früher
+  let meta = ls.get(metaKey(), {}); let metaFor = metaKey();
+  const reloadMeta = () => { if (metaFor !== metaKey()) { meta = ls.get(metaKey(), {}); metaFor = metaKey(); } };
+  const saveMeta = () => { reloadMeta(); ls.set(metaKey(), meta); };
   const markDirty = (id) => { meta[id] = { ...(meta[id] || {}), dirty: true, at: Date.now() }; saveMeta(); };
   const isDirty = (id) => !!(meta[id] && meta[id].dirty);
   const anyDirty = () => Object.values(meta).some(m => m.dirty);
   const knownRemote = () => Object.keys(meta).some(id => meta[id].seen);
 
   /* Sicherungen bei Konflikten (höchstens 10, neueste zuerst) */
-  const backups = () => ls.get(LS_BACKUPS, []);
-  function addBackup(b) { const all = [{ ...b, at: new Date().toISOString() }].concat(backups()).slice(0, 10); ls.set(LS_BACKUPS, all); }
-  function takeBackup(i) { const all = backups(); const b = all[i]; if (!b) return null; all.splice(i, 1); ls.set(LS_BACKUPS, all); return b; }
+  // Sicherungen gehören zum jeweiligen Konto (bzw. zum Bereich „ohne Konto“)
+  const bkKey = () => LS_BACKUPS + (session && session.uid ? ':' + session.uid : '');
+  const backups = () => ls.get(bkKey(), []);
+  const clearBackups = () => ls.del(bkKey());
+  function addBackup(b) { const all = [{ ...b, at: new Date().toISOString() }].concat(backups()).slice(0, 10); ls.set(bkKey(), all); }
+  function takeBackup(i) { const all = backups(); const b = all[i]; if (!b) return null; all.splice(i, 1); ls.set(bkKey(), all); return b; }
 
   /**
    * Ein Abgleich. local = { workspace: {data, at}, plans: [{id, data}] }.
@@ -1780,8 +1788,30 @@ const Cloud = (() => {
   }
   function markDeleted(id) { meta[id] = { ...(meta[id] || {}), dirty: true, deletedLocally: true, at: Date.now() }; saveMeta(); }
 
-  return { configured, config, setConfig, parseConfig, signedIn, user, signUp, signIn, signOut, recover, sync, pullAll, push,
-    markDirty, markDeleted, prime, isDirty, anyDirty, knownRemote, backups, takeBackup, addBackup, CloudError,
+  /** Dokument auf dem Server endgültig löschen (nur im eigenen Konto – Firestore-Regeln) */
+  async function remove(id) { await call(`${docsUrl()}/${encodeURIComponent(id)}`, { method: 'DELETE', auth: true }); delete meta[id]; saveMeta(); }
+  /**
+   * Konto zurücksetzen: löscht ALLE Dokumente des angemeldeten Kontos auf dem Server (Pläne endgültig) und ersetzt den
+   * Arbeitsstand durch einen leeren. Der leere Arbeitsstand bleibt als Dokument bestehen, damit andere angemeldete Geräte
+   * die Löschung beim nächsten Abgleich übernehmen (statt ihren alten Stand wieder hochzuladen).
+   * Das Anmeldekonto (E-Mail/Passwort) bleibt bestehen. Andere Konten und Daten ohne Konto werden nicht berührt.
+   * Danach wird nachgeprüft, ob auf dem Server wirklich nichts mehr übrig ist.
+   */
+  async function wipe(empty) {
+    if (!user()) throw new CloudError('Nicht angemeldet.', 'auth');
+    const rows = await pullAll();
+    for (const r of rows) if (r.id !== 'workspace') await remove(r.id);
+    meta = {}; meta.workspace = { at: Date.now() }; saveMeta();
+    await push('workspace', 'workspace', empty);
+    const left = await pullAll();
+    const bad = left.filter(r => r.id !== 'workspace' || JSON.stringify(r.data) !== JSON.stringify(empty));
+    if (bad.length) throw new CloudError(`Zurücksetzen unvollständig: ${bad.length} Einträge sind noch auf dem Server.`, 'server');
+    ls.del(bkKey());
+    return { removed: rows.filter(r => r.id !== 'workspace').length };
+  }
+
+  return { configured, config, setConfig, parseConfig, signedIn, user, signUp, signIn, signOut, recover, sync, pullAll, push, remove, wipe,
+    markDirty, markDeleted, prime, isDirty, anyDirty, knownRemote, backups, takeBackup, addBackup, clearBackups, CloudError,
     _reset() { meta = {}; session = null; } };
 })();
 if (typeof module !== 'undefined') module.exports = Cloud;
@@ -2623,16 +2653,66 @@ const Acct = {
     return Cloud.anyDirty() ? ['Gespeichert · Abgleich folgt', 'pending'] : ['✓ Mit deinem Konto abgeglichen', ''];
   },
   showStatus() { const s = this.status(); if (s) Store.status(s[0], s[1]); else if (Store.mode !== 'db') Store.status(Cloud && Cloud.configured() && this.available() ? 'Nur auf diesem Gerät – nicht angemeldet' : 'In diesem Browser gespeichert'); },
-  schedule(ms = 1500) { if (!this.active()) return; clearTimeout(this.timer); this.timer = setTimeout(() => this.run(), ms); this.showStatus(); },
+  schedule(ms = 1500) { if (!this.active() || this.wiping) return; clearTimeout(this.timer); this.timer = setTimeout(() => this.run(), ms); this.showStatus(); },
 
   /** lokale Pläne (Zwischenspeicher dieses Geräts) */
-  lsPlans() { try { const p = JSON.parse(localStorage.getItem(LS_PLANS) || '[]'); return Array.isArray(p) ? p : []; } catch (e) { return []; } },
-  setLsPlans(all) { try { localStorage.setItem(LS_PLANS, JSON.stringify(all)); } catch (e) { /* */ } },
+  lsPlans() { try { const p = JSON.parse(localStorage.getItem(lsPlansKey()) || '[]'); return Array.isArray(p) ? p : []; } catch (e) { return []; } },
+  setLsPlans(all) { try { localStorage.setItem(lsPlansKey(), JSON.stringify(all)); } catch (e) { /* */ } },
+  /** ausstehende Änderungen sofort im aktuellen Bereich speichern (vor dem Wechsel des Kontos) */
+  saveLocalNow() { clearTimeout(Store.timer); try { localStorage.setItem(lsKey(), JSON.stringify(st)); } catch (e) { /* */ } },
+  /** Daten des aktuellen Bereichs laden (Konto oder „ohne Konto“) – nie Daten eines anderen Bereichs */
+  reloadNamespace() {
+    st = normalize(Store.loadLocal() || freshState()); ui.saved = this.lsPlans();
+    this.clearUiData();
+    if (ui.tab === 'plan') ui.tab = 'meine';
+  },
+  /** Alles, was die Oberfläche aus den Daten des bisherigen Bereichs noch im Arbeitsspeicher hält, verwerfen
+      (Ergebnisse, geöffneter Plan, Formulare, Vorschauen, Prüfberichte, zuletzt erzeugte Datei …) */
+  clearUiData() {
+    if (ui.lastDownload) { try { URL.revokeObjectURL(ui.lastDownload.url); } catch (e) { /* */ } }
+    for (const k of ['results', 'plan', 'importPreview', 'alt', 'lastChange', 'lastDownload', 'exportError', 'editEvent', 'confirmDelete', 'confirmOff', 'wiConfirm',
+      'reviewSem', 'pdfReport', 'importNotes', 'parseError', 'parsing', 'apptForm', 'apptOpen', 'apptRef', 'apptDel', 'fw', 'check', 'anonConfirm', 'wipeConfirm', 'wipeMsg']) ui[k] = null;
+    ui.calOff = false; ui.calPreview = false; ui.semForm = false; ui.touched = false; ui.planKw = ''; ui.dismissed = new Set();
+    this.conflicts = [];
+  },
+  /** Daten, die auf diesem Gerät ohne Konto erstellt wurden (falls vorhanden) */
+  anonData() {
+    try {
+      const w = JSON.parse(localStorage.getItem(LS_BASE) || 'null'), p = JSON.parse(localStorage.getItem(LS_PLANS_BASE) || '[]');
+      const has = (w && ((w.courses || []).length || (w.appointments || []).length)) || (Array.isArray(p) && p.length);
+      return has ? { w, p: Array.isArray(p) ? p : [] } : null;
+    } catch (e) { return null; }
+  },
+  clearAnon() { try { localStorage.removeItem(LS_BASE); localStorage.removeItem(LS_PLANS_BASE); localStorage.removeItem('spo-cloud-backups'); } catch (e) { /* */ } },
   /** Hat dieses Gerät eigene Daten (nicht nur das mitgelieferte Beispiel)? */
   hasOwnData() { return !!Store.loadLocal() || this.lsPlans().length > 0; },
 
+  /**
+   * Konto zurücksetzen: alle Daten DIESES Kontos löschen – auf dem Server und auf diesem Gerät.
+   * Unberührt bleiben: das Anmeldekonto selbst, Daten ohne Konto auf diesem Gerät, alle anderen Konten.
+   * Erst wenn der Server bestätigt hat, wird auch auf dem Gerät geleert; bei einem Fehler bleibt hier alles, wie es war.
+   */
+  async resetAccount() {
+    if (!this.active()) throw new Error('Zum Zurücksetzen musst du angemeldet sein.');
+    const uid = Cloud.user().id;
+    this.wiping = true; clearTimeout(this.timer);
+    try {
+      for (let k = 0; k < 100 && this.busy; k++) await new Promise(r => setTimeout(r, 100));
+      clearTimeout(Store.timer);
+      const empty = { ...freshState(), resetAt: new Date().toISOString() };
+      const res = await Cloud.wipe(empty);
+      if (!Cloud.user() || Cloud.user().id !== uid) throw new Error('Die Anmeldung hat sich während des Zurücksetzens geändert – bitte erneut versuchen.');
+      try { localStorage.setItem(LS_BASE + ':' + uid, JSON.stringify(empty)); localStorage.setItem(LS_PLANS_BASE + ':' + uid, '[]'); } catch (e) { /* */ }
+      this.reloadNamespace(); this.error = null; this.offline = false; this.lastAt = new Date();
+      return res;
+    } catch (e) {
+      if (e && e.kind === 'offline') throw new Error('Keine Verbindung zum Server – zurückgesetzt wurde nichts. Bitte versuche es, sobald du online bist.');
+      throw new Error('Zurücksetzen fehlgeschlagen: ' + String(e && e.message || e) + ' Deine Daten auf diesem Gerät sind unverändert; bitte erneut versuchen.');
+    } finally { this.wiping = false; }
+  },
+
   async run() {
-    if (!this.active()) return;
+    if (!this.active() || this.wiping) return;
     if (this.busy) { this.again = true; return; }
     this.busy = true; this.showStatus();
     try {
@@ -2662,8 +2742,11 @@ const Acct = {
   apply(res) {
     let changedAny = false;
     if (res.workspace !== undefined && res.workspace) {
+      // auf einem anderen Gerät wurde das Konto zurückgesetzt → auch hier alles dieses Kontos verwerfen
+      const wasReset = res.workspace.resetAt && res.workspace.resetAt !== (st && st.resetAt);
       st = normalize(JSON.parse(JSON.stringify(res.workspace)));
-      try { localStorage.setItem(LS_KEY, JSON.stringify(st)); } catch (e) { /* */ }
+      if (wasReset) { Cloud.clearBackups(); this.setLsPlans([]); ui.saved = []; this.clearUiData(); toast('Dein Konto wurde auf einem anderen Gerät zurückgesetzt – alle Daten wurden auch hier entfernt.', 7000); }
+      try { localStorage.setItem(lsKey(), JSON.stringify(st)); } catch (e) { /* */ }
       ui.results = null; changedAny = true;
       if (ui.plan && ui.plan.sel && Object.keys(ui.plan.sel).some(cid => !courseById(cid))) { ui.plan = null; if (ui.tab === 'plan') ui.tab = 'meine'; }
     }
@@ -2782,7 +2865,8 @@ function accountBox() {
       ${mode !== 'reset' ? `<label class="field">Passwort${mode === 'signup' ? ' (mind. 8 Zeichen)' : ''}<input type="password" id="acct-pw" autocomplete="${mode === 'signup' ? 'new-password' : 'current-password'}"></label>` : ''}
       <div class="row"><button class="btn primary" data-act="acct-${mode}" ${ui.acctBusy ? 'disabled' : ''}>${ui.acctBusy ? '<span class="spin"></span> ' : ''}${mode === 'signup' ? 'Konto erstellen' : mode === 'reset' ? 'Link zum Zurücksetzen senden' : 'Anmelden'}</button></div>
       <div class="row small">${mode !== 'login' ? '<button class="btn ghost sm" data-act="acct-mode" data-id="login">Ich habe schon ein Konto</button>' : '<button class="btn ghost sm" data-act="acct-mode" data-id="signup">Neues Konto erstellen</button><button class="btn ghost sm" data-act="acct-mode" data-id="reset">Passwort vergessen?</button>'}</div>
-      <p class="small muted">Ohne Anmeldung funktioniert die App auch – dann nur auf diesem Gerät.</p></section>`;
+      <p class="small muted">Ohne Anmeldung funktioniert die App auch – dann nur auf diesem Gerät. Was du ohne Konto anlegst, wird beim Anmelden nicht automatisch übernommen.</p></section>
+      ${anonBox(false)}`;
   }
   const u = Cloud.user(); const s = Acct.status() || ['', ''];
   return `<section class="panel" style="gap:10px"><h2>Angemeldet</h2>
@@ -2795,8 +2879,59 @@ function accountBox() {
     ${ui.firstSync ? `<div class="alert warn small" id="first-sync"><b>In deinem Konto liegen schon Daten.</b>
       <span>Auf diesem Gerät gibt es ebenfalls eigene Daten. Welcher Arbeitsstand soll gelten? Gespeicherte Pläne werden in beiden Fällen zusammengeführt, und der andere Arbeitsstand wird als Sicherung behalten.</span>
       <div class="row"><button class="btn sm primary" data-act="acct-first" data-id="remote">Daten aus dem Konto übernehmen</button><button class="btn sm" data-act="acct-first" data-id="local">Daten dieses Geräts ins Konto hochladen</button></div></div>` : ''}
-    <div class="row"><button class="btn" data-act="acct-sync" ${Acct.busy ? 'disabled' : ''}>Jetzt abgleichen</button><button class="btn ghost" data-act="acct-logout">Abmelden</button></div>
-    <p class="small muted">Abmelden entfernt nur die Anmeldung auf diesem Gerät; deine Daten bleiben hier und im Konto erhalten.</p></section>`;
+    ${ui.logoutConfirm ? `<div class="alert warn small"><b>Noch nicht alles ist in deinem Konto angekommen</b> (keine Verbindung?).<span>Wenn du dich jetzt abmeldest, gehen die nicht abgeglichenen Änderungen verloren.</span>
+      <div class="row"><button class="btn sm" data-act="acct-logout-no">Abbrechen</button><button class="btn sm danger" data-act="acct-logout-force">Trotzdem abmelden</button></div></div>` : ''}
+    <div class="row"><button class="btn" data-act="acct-sync" ${Acct.busy ? 'disabled' : ''}>Jetzt abgleichen</button><button class="btn ghost" data-act="acct-logout" ${ui.acctBusy ? 'disabled' : ''}>Abmelden</button></div>
+    <p class="small muted">Beim Abmelden werden die Daten deines Kontos von diesem Gerät entfernt. Im Konto bleiben sie sicher erhalten.</p></section>
+    ${anonBox(true)}${wipeBox()}`;
+}
+
+/** Konto zurücksetzen (alle Daten dieses Kontos löschen, Konto bleibt) – getrennt von „Konto löschen“ */
+function wipeBox() {
+  const n = `${st.semesters.length} Semester, ${st.courses.length} Fächer, ${(st.appointments || []).length} persönliche Termine, ${(ui.saved || []).length} gespeicherte Pläne`;
+  const m = ui.wipeMsg ? `<div class="alert ${ui.wipeMsg.cls} small" id="wipe-msg">${esc(ui.wipeMsg.text)}</div>` : '';
+  const body = ui.wipeConfirm === 'busy' ? `<div class="row small"><span class="spin"></span> Wird zurückgesetzt …</div>`
+    : ui.wipeConfirm ? `<div class="alert bad small" id="wipe-confirm"><b>Möchtest du wirklich alle deine gespeicherten Daten zurücksetzen? Diese Aktion kann nicht rückgängig gemacht werden.</b>
+      <span>Gelöscht wird in deinem Konto ${esc(Cloud.user() ? Cloud.user().email : '')}: ${esc(n)}, dazu Wünsche, Sperrzeiten, Kalender-Vergleichsstände und gesicherte ältere Fassungen. Wer eine Kopie behalten will, lädt vorher eine Sicherung herunter.</span>
+      <div class="row"><button class="btn sm" data-act="acct-export">Vorher Sicherung herunterladen</button><button class="btn sm danger" data-act="acct-wipe-yes">Ja, alles zurücksetzen</button><button class="btn sm primary" data-act="acct-wipe-no">Abbrechen</button></div></div>`
+    : `<div class="row"><button class="btn sm ghost danger" data-act="acct-wipe-ask">Konto zurücksetzen …</button></div>`;
+  return `<section class="panel" style="gap:8px" id="wipe-box"><h2>Konto zurücksetzen</h2>
+    <p class="small">Löscht <b>alle gespeicherten Daten deines Kontos</b> – auf dem Server und auf allen Geräten, auf denen du angemeldet bist. Dein Konto selbst (E-Mail und Passwort) bleibt bestehen, du startest danach leer. Daten ohne Konto auf diesem Gerät und andere Konten sind nicht betroffen. Das ist <b>nicht</b> „Konto löschen“.</p>
+    ${m}${body}</section>`;
+}
+
+/** Daten „ohne Konto“ auf diesem Gerät: bewusst übernehmen oder löschen – nie automatisch */
+function anonBox(signedIn) {
+  const a = Acct.anonData(); if (!a) return '';
+  const w = a.w || {};
+  const what = `${(w.semesters || []).length} Semester, ${(w.courses || []).length} Fächer, ${(w.appointments || []).length} persönliche Termine, ${a.p.length} gespeicherte Pläne`;
+  const ask = ui.anonConfirm;
+  return `<section class="panel" style="gap:8px" id="anon-box"><h2>Daten ohne Konto auf diesem Gerät</h2>
+    <p class="small">${what}. ${signedIn ? 'Sie gehören <b>nicht</b> zu deinem Konto und werden nicht automatisch übernommen.' : 'Sie liegen nur auf diesem Gerät. Auf einem gemeinsam genutzten Gerät kannst du sie hier löschen.'}</p>
+    ${ask === 'take' ? `<div class="alert warn small"><span>Dein aktueller Konto-Stand wird durch diese Daten ersetzt (vorher gesichert, wiederherstellbar). Gespeicherte Pläne werden ergänzt.</span>
+      <div class="row"><button class="btn sm primary" data-act="acct-take-anon">Ja, in mein Konto übernehmen</button><button class="btn sm" data-act="acct-anon-no">Abbrechen</button></div></div>`
+    : ask === 'del' ? `<div class="alert warn small"><span>Diese Daten werden von diesem Gerät gelöscht. Das lässt sich nicht rückgängig machen.</span>
+      <div class="row"><button class="btn sm danger" data-act="acct-del-anon">Ja, löschen</button><button class="btn sm" data-act="acct-anon-no">Abbrechen</button></div></div>`
+    : `<div class="row">${signedIn ? '<button class="btn sm" data-act="acct-anon-ask" data-id="take">In mein Konto übernehmen</button>' : ''}<button class="btn sm ghost danger" data-act="acct-anon-ask" data-id="del">Auf diesem Gerät löschen</button></div>`}
+  </section>`;
+}
+
+/** einmalige Umstellung auf getrennte Speicherbereiche: bisher gemeinsame Gerätedaten gehören dem angemeldeten Konto */
+function acctMigrate() {
+  try {
+    if (localStorage.getItem('spo-ns-v2') || typeof Cloud === 'undefined' || insideClaude()) return;
+    if (Cloud.configured() && Cloud.signedIn() && Cloud.user()) {
+      const id = Cloud.user().id, meta = localStorage.getItem('spo-cloud-meta:' + id) || localStorage.getItem('spo-cloud-meta');
+      if (meta && meta !== '{}' && !localStorage.getItem(LS_BASE + ':' + id)) {
+        const w = localStorage.getItem(LS_BASE), p = localStorage.getItem(LS_PLANS_BASE), b = localStorage.getItem('spo-cloud-backups');
+        if (w) localStorage.setItem(LS_BASE + ':' + id, w);
+        if (p) localStorage.setItem(LS_PLANS_BASE + ':' + id, p);
+        if (b) localStorage.setItem('spo-cloud-backups:' + id, b);
+        localStorage.removeItem(LS_BASE); localStorage.removeItem(LS_PLANS_BASE); localStorage.removeItem('spo-cloud-backups');
+      }
+    }
+    localStorage.setItem('spo-ns-v2', '1');
+  } catch (e) { /* privat */ }
 }
 
 /* ---------- Aktionen ---------- */
@@ -2807,14 +2942,53 @@ async function onAcctClick(act, id) {
     case 'acct-mode': ui.acctMode = id; ui.acctMsg = null; ui.acctEmail = val('#acct-email'); render(); return true;
     case 'cfg-save': try { Cloud.setConfig(val('#cfg-text')); ui.acctMsg = { cls: 'ok', text: 'Gespeichert. Jetzt anmelden oder ein Konto erstellen.' }; } catch (e) { ui.acctMsg = { cls: 'bad', text: e.message }; } render(); return true;
     case 'acct-login': { const email = val('#acct-email'), pw = $('#acct-pw') ? $('#acct-pw').value : ''; ui.acctEmail = email;
-      await busy(async () => { await Cloud.signIn(email, pw); ui.acctMsg = { cls: 'ok', text: 'Angemeldet.' }; Acct.error = null; Acct.schedule(50); }); return true; }
+      Acct.saveLocalNow();
+      await busy(async () => { await Cloud.signIn(email, pw); Acct.reloadNamespace(); ui.firstSync = null; ui.acctMsg = { cls: 'ok', text: 'Angemeldet.' }; Acct.error = null; Acct.schedule(50); }); return true; }
     case 'acct-signup': { const email = val('#acct-email'), pw = $('#acct-pw') ? $('#acct-pw').value : ''; ui.acctEmail = email;
       if (pw.length < 8) { ui.acctMsg = { cls: 'bad', text: 'Das Passwort braucht mindestens 8 Zeichen.' }; render(); return true; }
-      await busy(async () => { const r = await Cloud.signUp(email, pw); if (r.signedIn) { ui.acctMsg = { cls: 'ok', text: 'Konto erstellt und angemeldet.' }; Acct.schedule(50); } }); return true; }
+      Acct.saveLocalNow();
+      await busy(async () => { const r = await Cloud.signUp(email, pw); if (r.signedIn) { Acct.reloadNamespace(); ui.firstSync = null; ui.acctMsg = { cls: 'ok', text: 'Konto erstellt und angemeldet. Es startet leer – Daten von diesem Gerät kannst du unten bewusst übernehmen.' }; Acct.schedule(50); } }); return true; }
     case 'acct-reset': { const email = val('#acct-email'); ui.acctEmail = email;
       await busy(async () => { await Cloud.recover(email); ui.acctMode = 'login'; ui.acctMsg = { cls: 'info', text: `Falls es ein Konto für ${email} gibt, ist jetzt eine E-Mail unterwegs. Über den Link darin legst du ein neues Passwort fest und meldest dich danach hier an. (Auch im Spam-Ordner nachsehen.)` }; }); return true; }
-    case 'acct-logout': await Cloud.signOut(); Acct.lastAt = null; Acct.error = null; ui.firstSync = null; ui.acctMsg = { cls: 'info', text: 'Abgemeldet. Deine Daten bleiben auf diesem Gerät.' }; Acct.showStatus(); render(); return true;
+    case 'acct-logout': case 'acct-logout-force': {
+      if (act === 'acct-logout') {
+        ui.acctBusy = true; render();
+        if (Store.timer) { clearTimeout(Store.timer); await Store.flush(); }
+        for (let i = 0; i < 3 && Cloud.anyDirty() && !Acct.offline; i++) { await Acct.run(); for (let k = 0; k < 40 && Acct.busy; k++) await new Promise(r => setTimeout(r, 100)); }
+        ui.acctBusy = false;
+        if (Cloud.anyDirty()) { ui.logoutConfirm = true; render(); return true; }
+      }
+      const u = Cloud.user();
+      if (u) { try { localStorage.removeItem(LS_BASE + ':' + u.id); localStorage.removeItem(LS_PLANS_BASE + ':' + u.id); } catch (e) { /* */ } }
+      await Cloud.signOut(); Acct.lastAt = null; Acct.error = null; ui.firstSync = null; ui.logoutConfirm = false;
+      Acct.reloadNamespace();
+      ui.acctMsg = { cls: 'info', text: 'Abgemeldet. Die Daten deines Kontos wurden von diesem Gerät entfernt – sie sind sicher in deinem Konto und nach dem Anmelden wieder da.' };
+      Acct.showStatus(); render(); return true; }
+    case 'acct-logout-no': ui.logoutConfirm = false; render(); return true;
+    case 'acct-take-anon': {
+      const a = Acct.anonData(); if (!a) return true;
+      Cloud.addBackup({ id: 'workspace', kind: 'workspace', data: JSON.parse(JSON.stringify(st)), from: 'Konto vor dem Übernehmen der Gerätedaten' });
+      st = normalize(JSON.parse(JSON.stringify(a.w || freshState())));
+      const all = Acct.lsPlans();
+      for (const p of a.p) { const i = all.findIndex(x => x.id === p.id); if (i >= 0) all[i] = p; else all.push(p); if (Acct.active()) Cloud.markDirty(p.id); }
+      Acct.setLsPlans(all); ui.saved = all; ui.results = null; ui.plan = null;
+      Acct.clearAnon(); ui.anonConfirm = null; changed(); render();
+      toast('Daten von diesem Gerät in dein Konto übernommen.', 5000); return true; }
+    case 'acct-anon-ask': ui.anonConfirm = id; render(); return true;
+    case 'acct-anon-no': ui.anonConfirm = null; render(); return true;
+    case 'acct-del-anon': {
+      Acct.clearAnon(); ui.anonConfirm = null;
+      if (!Cloud.signedIn()) Acct.reloadNamespace();
+      render(); toast('Daten ohne Konto von diesem Gerät gelöscht.'); return true; }
     case 'acct-sync': Acct.run(); render(); return true;
+    case 'acct-wipe-ask': ui.wipeConfirm = true; ui.wipeMsg = null; render(); return true;
+    case 'acct-wipe-no': ui.wipeConfirm = null; render(); return true;
+    case 'acct-wipe-yes': {
+      if (ui.wipeConfirm !== true) return true;
+      ui.wipeConfirm = 'busy'; render();
+      try { const r = await Acct.resetAccount(); ui.wipeConfirm = null; ui.wipeMsg = { cls: 'ok', text: `Zurückgesetzt. Alle Daten deines Kontos wurden gelöscht (auf dem Server${r.removed ? ', darunter ' + r.removed + ' gespeicherte Pläne' : ''} und auf diesem Gerät). Dein Konto bleibt bestehen – du kannst jetzt neu anfangen.` }; toast('Konto zurückgesetzt.'); }
+      catch (e) { ui.wipeConfirm = null; ui.wipeMsg = { cls: 'bad', text: String(e && e.message || e) }; }
+      Acct.showStatus(); render(); return true; }
     case 'acct-first': {
       const fs = ui.firstSync; if (!fs) return true;
       const ws = fs.rows.find(r => r.id === 'workspace');
@@ -2855,7 +3029,12 @@ async function acctStart() {
 const C = Core;
 const $ = (s, r = document) => r.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const LS_KEY = 'spo-workspace-v1', LS_PLANS = 'spo-plans-v1';
+const LS_BASE = 'spo-workspace-v1', LS_PLANS_BASE = 'spo-plans-v1';
+/* Jedes Konto hat auf dem Gerät seinen eigenen Speicherbereich; ohne Anmeldung gibt es einen getrennten Bereich „ohne Konto“.
+   So sieht nach dem Abmelden oder auf einem fremden Gerät niemand die Daten eines Kontos. */
+const lsSuffix = () => (typeof Cloud !== 'undefined' && !insideClaude() && Cloud.signedIn() && Cloud.user()) ? ':' + Cloud.user().id : '';
+const lsKey = () => LS_BASE + lsSuffix();
+const lsPlansKey = () => LS_PLANS_BASE + lsSuffix();
 const DEFAULT_PREFS = {
   weights: { freeDays: 7, fewDays: 6, gaps: 8, short: 4, early: 5, late: 4, daysOff: 6, blocks: 8 },
   earlyTime: 540, earlyHard: false, lateTime: 1020, lateHard: false,
@@ -2881,7 +3060,7 @@ function cap(name) {
 const Store = {
   mode: 'local', db: null, uid: null, timer: null,
   status(text, cls = '') { const el = $('#savestate'); if (el) { el.textContent = text; el.className = 'savestate ' + cls; } },
-  loadLocal() { try { const raw = localStorage.getItem(LS_KEY); return raw ? JSON.parse(raw) : null; } catch (e) { return null; } },
+  loadLocal() { try { const raw = localStorage.getItem(lsKey()); return raw ? JSON.parse(raw) : null; } catch (e) { return null; } },
   async connect() {
     const [db, user] = await Promise.all([cap('db'), cap('user')]);
     if (!db || !user) { this.status('In diesem Browser gespeichert'); return null; }
@@ -2902,7 +3081,7 @@ const Store = {
   },
   async flush() {
     const data = JSON.parse(JSON.stringify(st));
-    try { localStorage.setItem(LS_KEY, JSON.stringify(data)); } catch (e) { /* privat */ }
+    try { localStorage.setItem(lsKey(), JSON.stringify(data)); } catch (e) { /* privat */ }
     if (this.mode === 'db') {
       try { await this.db.doc(`data/users/${this.uid}/workspace`).set({ state: data, savedAt: new Date().toISOString() }); this.status('Im Konto gespeichert'); }
       catch (e) { this.status(e && e.code === 'quota_exceeded' ? 'Speicher voll – bitte alte Pläne löschen' : 'Speichern fehlgeschlagen', 'err'); }
@@ -2913,15 +3092,15 @@ const Store = {
     if (this.mode === 'db') {
       try { const q = await this.db.collection(`data/users/${this.uid}`).get(); return q.docs.filter(d => d.id.startsWith('plan_')).map(d => JSON.parse(JSON.stringify(d.data()))); } catch (e) { return []; }
     }
-    try { return JSON.parse(localStorage.getItem(LS_PLANS) || '[]'); } catch (e) { return []; }
+    try { return JSON.parse(localStorage.getItem(lsPlansKey()) || '[]'); } catch (e) { return []; }
   },
   async savePlan(p) {
     if (this.mode === 'db') { await this.db.doc(`data/users/${this.uid}/${p.id}`).set(JSON.parse(JSON.stringify(p))); }
-    else { const all = (await this.listPlans()).filter(x => x.id !== p.id); all.push(p); localStorage.setItem(LS_PLANS, JSON.stringify(all)); if (Acct.active()) { Cloud.markDirty(p.id); Acct.schedule(); } }
+    else { const all = (await this.listPlans()).filter(x => x.id !== p.id); all.push(p); localStorage.setItem(lsPlansKey(), JSON.stringify(all)); if (Acct.active()) { Cloud.markDirty(p.id); Acct.schedule(); } }
   },
   async deletePlan(id) {
     if (this.mode === 'db') await this.db.doc(`data/users/${this.uid}/${id}`).delete();
-    else { const all = (await this.listPlans()).filter(x => x.id !== id); localStorage.setItem(LS_PLANS, JSON.stringify(all)); if (Acct.active()) { Cloud.markDeleted(id); Acct.schedule(); } }
+    else { const all = (await this.listPlans()).filter(x => x.id !== id); localStorage.setItem(lsPlansKey(), JSON.stringify(all)); if (Acct.active()) { Cloud.markDeleted(id); Acct.schedule(); } }
   },
 };
 function changed() { ui.touched = true; ui.results && (ui.results.stale = true); Store.schedule(); }
@@ -4381,13 +4560,14 @@ function checkPanel() {
 
 /* =================== START =================== */
 (async function start() {
+  if (typeof acctMigrate === 'function') acctMigrate();
   const local = Store.loadLocal();
-  st = normalize(local || seedState());
-  try { const p = JSON.parse(localStorage.getItem(LS_PLANS) || '[]'); ui.saved = Array.isArray(p) ? p : []; } catch (e) { ui.saved = []; }
+  st = normalize(local || freshState()); // neue Nutzer starten leer – kein Beispiel, keine fremden Daten
+  try { const p = JSON.parse(localStorage.getItem(lsPlansKey()) || '[]'); ui.saved = Array.isArray(p) ? p : []; } catch (e) { ui.saved = []; }
   const firstOpen = allQuestions().find(q => q.blocking);
   if (firstOpen) ui.reviewSem = firstOpen.sem.id;
   render();
-  if (!local) Store.status('Beispiel aus deinem E2-PDF geladen');
+  if (!local) Store.status('Noch keine Daten – lade deinen Stundenplan als PDF hoch');
   const remote = await Store.connect();
   if (Store.mode !== 'db') await acctStart();
   if (Store.mode === 'db') {
