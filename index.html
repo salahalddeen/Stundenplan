@@ -10,7 +10,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-<script>window.SPO_VERSION = {"name": "1.4", "build": "f28ae3cb93", "date": "20.10.2026 00:23"};</script>
+<script>window.SPO_VERSION = {"name": "1.5", "build": "14beaa2563", "date": "20.10.2026 01:06"};</script>
 <script src="config.js"></script>
 <title>Stundenplan-Optimierer</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -1406,7 +1406,9 @@ const Core = (() => {
   function icsEvent(it, stamp, seq) {
     return ['BEGIN:VEVENT', fold('UID:' + it.uid), 'DTSTAMP:' + stamp, 'SEQUENCE:' + seq, 'STATUS:CONFIRMED',
       `DTSTART;TZID=Europe/Berlin:${it.date}T${hm(it.start)}`, `DTEND;TZID=Europe/Berlin:${it.date}T${hm(it.end)}`,
-      fold('SUMMARY:' + icsEscape(it.summary)), fold('LOCATION:' + icsEscape(it.location)), fold('DESCRIPTION:' + icsEscape(it.description)), 'END:VEVENT'];
+      fold('SUMMARY:' + icsEscape(it.summary)), fold('LOCATION:' + icsEscape(it.location)), fold('DESCRIPTION:' + icsEscape(it.description)),
+      ...(it.alarm > 0 ? ['BEGIN:VALARM', 'ACTION:DISPLAY', fold('DESCRIPTION:' + icsEscape('Erinnerung: ' + it.summary)), `TRIGGER:-PT${Math.round(it.alarm)}M`, 'END:VALARM'] : []),
+      'END:VEVENT'];
   }
   function icsCancel(old, stamp, seq) {
     return ['BEGIN:VEVENT', fold('UID:' + old.uid), 'DTSTAMP:' + stamp, 'SEQUENCE:' + seq, 'STATUS:CANCELLED',
@@ -1468,6 +1470,21 @@ const Appts = (() => {
     if (r.type === 'weekly') {
       const until = parseYmd(r.until) || addDays(d0, 7 * 11);
       const out = []; for (let d = d0, i = 0; d <= until && i < 60; d = addDays(d, 7), i++) out.push(one(d));
+      return out;
+    }
+    if (r.type === 'daily') {
+      const until = parseYmd(r.until) || addDays(d0, 13);
+      const out = []; for (let d = d0, i = 0; d <= until && i < 120; d = addDays(d, 1), i++) out.push(one(d));
+      return out;
+    }
+    if (r.type === 'monthly') { // gleicher Tag im Monat; Monate ohne diesen Tag (z. B. 31.) werden ausgelassen
+      const until = parseYmd(r.until) || new Date(Date.UTC(d0.getUTCFullYear(), d0.getUTCMonth() + 5, d0.getUTCDate()));
+      const out = [];
+      for (let i = 0; i < 36; i++) {
+        const d = new Date(Date.UTC(d0.getUTCFullYear(), d0.getUTCMonth() + i, d0.getUTCDate()));
+        if (d > until) break;
+        if (d.getUTCDate() === d0.getUTCDate()) out.push(one(d));
+      }
       return out;
     }
     if (r.type === 'weeks' && r.weeksRaw) {
@@ -1575,11 +1592,114 @@ const Appts = (() => {
     return out;
   }
 
+  /* ---------- Machbarkeit mit Fahrzeit und Puffer ----------
+     Ein Termin a hat: start/end, place, travelTo (Fahrzeit hin, Minuten oder null = unbekannt), travelBack (Rückfahrt),
+     bufBefore/bufAfter (nur wenn a.buffer). Fahrzeiten werden nie geschätzt – fehlen sie, heißt das Ergebnis „Nicht prüfbar“.
+     Geprüft wird pro Vorkommen gegen die Verpflichtung direkt davor und direkt danach am selben Tag:
+     Hochschule (nur Veranstaltungen, die in dieser KW stattfinden) und andere persönliche Termine. */
+  const TIGHT = 10; // weniger Luft als das = „knapp“
+  const num = (v) => (v === '' || v == null || isNaN(+v)) ? null : +v;
+  const bufB = (a) => a.buffer ? (+a.bufBefore || 0) : 0, bufA = (a) => a.buffer ? (+a.bufAfter || 0) : 0;
+  const samePlace = (x, y) => !!(x && y && String(x).trim().toLowerCase() === String(y).trim().toLowerCase());
+  /** alle Verpflichtungen an einem Datum außer dem geprüften Termin selbst */
+  function obligations(evs, d, others, sem, selfId) {
+    const key = isoKey(d), wd = weekdayOf(d), date = ymd(d);
+    const out = C.mergeSlots(evs).filter(e => e.weekday === wd && e.keys.includes(key))
+      .map(e => ({ kind: 'uni', start: e.start, end: e.end, label: evName(e), group: e.label, place: 'Hochschule', e }));
+    for (const x of others || []) {
+      if (x.id === selfId || x.done || x.decision === 'skip') continue;
+      for (const o of occurrences(x, sem)) if (o.date === date) out.push({ kind: 'personal', start: o.start, end: o.end, label: x.title || 'Termin', place: x.place, a: x });
+    }
+    return out.sort((p, q) => p.start - q.start || p.end - q.end);
+  }
+  /** Ergebnis: { status: 'ok'|'tight'|'bad'|'unknown', reason, prev, next, overlaps, before, after } */
+  function feasibility(evs, a, occ, others, sem) {
+    const d = occ.d || parseYmd(occ.date), S = occ.start, E = occ.end;
+    const obs = obligations(evs, d, others, sem, a.id);
+    const overlaps = obs.filter(o => o.start < E && S < o.end);
+    const res = { status: 'ok', reason: '', overlaps, prev: null, next: null, before: null, after: null, date: ymd(d), d, start: S, end: E };
+    const where = a.place ? a.place : 'den Termin';
+    if (overlaps.length) {
+      const o = overlaps[0];
+      res.status = 'bad'; res.reason = `Überschneidet sich mit ${o.kind === 'uni' ? '' : 'deinem Termin '}„${o.label}“ (${o.group && o.group !== o.label ? o.group + ', ' : ''}${fmt(o.start)}–${fmt(o.end)})${overlaps.length > 1 ? ` und ${overlaps.length - 1} weiteren` : ''}.`;
+      return res;
+    }
+    const prev = obs.filter(o => o.end <= S).sort((p, q) => q.end - p.end)[0] || null;
+    const next = obs.filter(o => o.start >= E).sort((p, q) => p.start - q.start)[0] || null;
+    res.prev = prev; res.next = next;
+    const parts = [];
+    if (prev) {
+      let travel = num(a.travelTo); if (travel == null && prev.kind === 'personal' && samePlace(prev.place, a.place)) travel = 0;
+      const pb = prev.kind === 'personal' ? bufA(prev.a) : 0;
+      if (travel == null) res.before = { unknown: true };
+      else {
+        const arrive = prev.end + pb + travel, latest = S - bufB(a), slack = latest - arrive;
+        res.before = { travel, arrive, slack, late: arrive - S };
+        parts.push({ slack, text: arrive > S ? `Du erreichst ${where} voraussichtlich ${arrive - S} Minuten nach Terminbeginn („${prev.label}“ endet ${fmt(prev.end)}, ${travel} Min. Fahrt).`
+          : slack < 0 ? `Ankunft ${fmt(arrive)} – ${-slack} Min. weniger Puffer als eingeplant („${prev.label}“ endet ${fmt(prev.end)}).`
+          : `${slack} Min. Luft nach „${prev.label}“ (Ankunft ${fmt(arrive)}).` });
+      }
+    }
+    if (next) {
+      let travel = next.kind === 'personal' ? num(next.a.travelTo) : null;
+      if (travel == null) travel = num(a.travelBack);
+      if (travel == null && next.kind === 'personal' && samePlace(next.place, a.place)) travel = 0;
+      const nb = next.kind === 'personal' ? bufB(next.a) : 0;
+      if (travel == null) res.after = { unknown: true };
+      else {
+        const arriveNext = E + bufA(a) + travel, latest = next.start - nb, slack = latest - arriveNext;
+        res.after = { travel, arriveNext, slack, late: arriveNext - next.start };
+        parts.push({ slack, text: arriveNext > next.start ? `Du kommst voraussichtlich ${arriveNext - next.start} Minuten zu spät zu „${next.label}“ (${fmt(next.start)}).`
+          : slack < 0 ? `Pünktlich zu „${next.label}“, aber ${-slack} Min. weniger Puffer als eingeplant.`
+          : `${slack} Min. Luft bis „${next.label}“ (${fmt(next.start)}).` });
+      }
+    }
+    const worst = parts.slice().sort((p, q) => p.slack - q.slack)[0];
+    if (worst && worst.slack < 0) { res.status = 'bad'; res.reason = worst.text; return res; }
+    if ((res.before && res.before.unknown) || (res.after && res.after.unknown)) {
+      res.status = 'unknown';
+      const miss = [];
+      if (res.before && res.before.unknown) miss.push(`Fahrzeit hin (davor: „${prev.label}“ bis ${fmt(prev.end)})`);
+      if (res.after && res.after.unknown) miss.push(`Rückfahrt (danach: „${next.label}“ ab ${fmt(next.start)})`);
+      res.reason = `Es fehlt: ${miss.join(' und ')}.`; return res;
+    }
+    if (worst && worst.slack < TIGHT) { res.status = 'tight'; res.reason = worst.text; return res; }
+    res.reason = worst ? worst.text : 'Keine anderen Termine an diesem Tag.';
+    return res;
+  }
+  function feasibilityAll(evs, a, others, sem) {
+    const occ = occurrences(a, sem).map(o => feasibility(evs, a, o, others, sem));
+    const count = (s) => occ.filter(r => r.status === s).length;
+    const status = count('bad') ? 'bad' : count('unknown') ? 'unknown' : count('tight') ? 'tight' : 'ok';
+    return { occ, status, bad: count('bad'), unknown: count('unknown'), tight: count('tight') };
+  }
+  /** Vorschläge: freie Zeiten am selben und an den folgenden Tagen, in die Termin + Fahrt + Puffer passen */
+  function suggest(evs, a, others, sem, opts = {}) {
+    const dur = a.end - a.start, d0 = parseYmd(opts.from || a.date); if (!d0 || dur <= 0) return [];
+    const from = opts.dayFrom ?? 480, to = opts.dayTo ?? 1200, max = opts.max || 3, out = [];
+    for (let i = 0; i < (opts.days || 7) && out.length < max; i++) {
+      const d = addDays(d0, i);
+      if (!opts.weekend && weekdayOf(d) >= 5) continue;
+      // Zeit möglichst nah an der gewünschten Uhrzeit; „machbar“ vor „knapp“
+      let tight = null, best = null;
+      const near = (f) => Math.abs(f.start - a.start);
+      for (let s0 = Math.ceil(from / 15) * 15; s0 + dur <= to; s0 += 15) {
+        if (i === 0 && s0 === a.start) continue; // die geprüfte Zeit selbst
+        const f = feasibility(evs, { ...a, repeat: { type: 'none' } }, { date: ymd(d), d, start: s0, end: s0 + dur }, others, sem);
+        if (f.status === 'ok' && (!best || near(f) < near(best))) best = f;
+        if (f.status === 'tight' && (!tight || near(f) < near(tight))) tight = f;
+      }
+      const f = best || tight;
+      if (f) out.push({ date: f.date, d, start: f.start, end: f.end, status: f.status, reason: f.reason });
+    }
+    return out;
+  }
+
   /* ---------- Textbausteine (neutral – keine Wertung, was wichtiger ist) ---------- */
   const kindText = { 'termin-komplett': 'Dein Termin liegt vollständig in dieser Veranstaltung', 'veranstaltung-komplett': 'Die Veranstaltung liegt vollständig in deinem Termin', 'teilweise': 'Teilweise Überschneidung' };
   const evName = (e) => e.course.name && e.course.name !== e.course.code ? e.course.name : e.course.code;
 
-  return { CATEGORIES, PRIORITIES, NEAR, parseYmd, ymd, weekdayOf, isoKey, fmtDate, addDays, occurrences, checkSlot, checkAppt, personalConflicts, daySegments, freeWindows, kindText, evName };
+  return { CATEGORIES, PRIORITIES, NEAR, parseYmd, ymd, weekdayOf, isoKey, fmtDate, addDays, occurrences, checkSlot, checkAppt, personalConflicts, daySegments, freeWindows, kindText, evName, TIGHT, obligations, feasibility, feasibilityAll, suggest };
 })();
 if (typeof module !== 'undefined') module.exports = Appts;
 
@@ -2314,29 +2434,40 @@ const apptsAll = () => st.appointments || (st.appointments = []);
 function apptCheck(a, ref) { return A.checkAppt(ref.evs, a, ref.sem); }
 function personalConflictsOf(a, ref) { return A.personalConflicts(apptsAll().filter(x => x.decision !== 'skip'), ref.sem).filter(p => p.a.id === a.id || p.b.id === a.id); }
 
-/* ---------- Reiter-Zähler: offene Konflikte ---------- */
+/* ---------- Machbarkeit (Fahrzeit, Puffer, Termine davor/danach) ---------- */
+const FEAS = { ok: ['ok', '✓ Machbar'], tight: ['warn', '⚠ Knapp'], bad: ['bad', '✗ Nicht machbar'], unknown: ['', '? Nicht prüfbar'] };
+const feasPill = (s) => `<span class="pill ${FEAS[s][0]}">${FEAS[s][1]}</span>`;
+const activeAppts = () => apptsAll().filter(x => !x.done && x.decision !== 'skip');
+function apptFeas(a, ref) { return A.feasibilityAll(ref.evs, a, activeAppts(), ref.sem); }
+
+/* ---------- Reiter-Zähler: nicht machbare, offene Termine ---------- */
 function apptTabExtra() {
   const list = apptsAll(); if (!list.length) return '';
   const ref = refInfo();
-  const open = ref ? list.filter(a => !a.decision && apptCheck(a, ref).conflictCount).length : 0;
-  return open ? `<span class="count warn">${open}</span>` : `<span class="count">${list.length}</span>`;
+  const open = ref ? list.filter(a => !a.done && !a.decision && apptFeas(a, ref).status === 'bad').length : 0;
+  return open ? `<span class="count warn">${open}</span>` : `<span class="count">${list.filter(a => !a.done).length}</span>`;
 }
 
 /* ---------- Formular ---------- */
 const todayYmd = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
 function newForm(prefill = {}) {
-  return Object.assign({ id: null, title: '', category: 'Arzttermin', date: todayYmd(), start: '10:00', end: '11:00', place: '', note: '', repeatType: 'none', until: '', weeksRaw: '', priority: '', buffer: false, bufBefore: 30, bufAfter: 30, alts: [] }, prefill);
+  return Object.assign({ id: null, title: '', category: 'Arzttermin', date: todayYmd(), start: '10:00', end: '11:00', place: '', note: '', repeatType: 'none', until: '', weeksRaw: '', priority: '',
+    bufBefore: '0', bufAfter: '0', travelTo: '', travelBack: '', travelSrc: '', remind: '0', alts: [] }, prefill);
 }
 const form = () => ui.apptForm || (ui.apptForm = newForm());
+const minOrNull = (v) => (v === '' || v == null || isNaN(+v)) ? null : Math.max(0, Math.round(+v));
 function formToAppt(f) {
+  const bb = +f.bufBefore || 0, ba = +f.bufAfter || 0;
   return { title: f.title.trim() || f.category, category: f.category, date: f.date, start: C.toMin(f.start), end: C.toMin(f.end), place: f.place.trim(), note: f.note.trim(),
-    repeat: f.repeatType === 'weekly' ? { type: 'weekly', until: f.until } : f.repeatType === 'weeks' ? { type: 'weeks', weeksRaw: f.weeksRaw } : { type: 'none' },
-    priority: f.priority, buffer: !!f.buffer, bufBefore: +f.bufBefore || 0, bufAfter: +f.bufAfter || 0 };
+    repeat: ['weekly', 'daily', 'monthly'].includes(f.repeatType) ? { type: f.repeatType, until: f.until } : f.repeatType === 'weeks' ? { type: 'weeks', weeksRaw: f.weeksRaw } : { type: 'none' },
+    priority: f.priority, buffer: bb > 0 || ba > 0, bufBefore: bb, bufAfter: ba,
+    travelTo: minOrNull(f.travelTo), travelBack: minOrNull(f.travelBack), travelSrc: f.travelSrc || ((f.travelTo !== '' || f.travelBack !== '') ? 'eingegeben' : ''), remind: +f.remind || 0 };
 }
 function apptToForm(a) {
   return newForm({ id: a.id, title: a.title, category: a.category, date: a.date, start: C.fmt(a.start), end: C.fmt(a.end), place: a.place || '', note: a.note || '',
     repeatType: (a.repeat && a.repeat.type) || 'none', until: (a.repeat && a.repeat.until) || '', weeksRaw: (a.repeat && a.repeat.weeksRaw) || '', priority: a.priority || '',
-    buffer: !!a.buffer, bufBefore: a.bufBefore ?? 30, bufAfter: a.bufAfter ?? 30 });
+    bufBefore: String(a.buffer ? a.bufBefore || 0 : 0), bufAfter: String(a.buffer ? a.bufAfter || 0 : 0),
+    travelTo: a.travelTo == null ? '' : String(a.travelTo), travelBack: a.travelBack == null ? '' : String(a.travelBack), travelSrc: a.travelSrc || '', remind: String(a.remind || 0) });
 }
 function formProblem(f) {
   if (!A.parseYmd(f.date)) return 'Bitte ein Datum wählen.';
@@ -2344,7 +2475,20 @@ function formProblem(f) {
   if (s == null || e == null) return 'Bitte Beginn und Ende eingeben.';
   if (e <= s) return 'Das Ende muss nach dem Beginn liegen.';
   if (f.repeatType === 'weeks' && !C.parseWeeks(f.weeksRaw).weeks.length) return 'Bitte Kalenderwochen eingeben, z. B. 43,45-47.';
+  if (['travelTo', 'travelBack', 'bufBefore', 'bufAfter'].some(k => f[k] !== '' && (isNaN(+f[k]) || +f[k] < 0))) return 'Fahrzeit und Puffer als Minuten eingeben (0 oder mehr).';
   return '';
+}
+/* gespeicherte Orte: Fahrzeiten, die du einmal eingegeben hast, werden für denselben Ort wieder vorgeschlagen */
+const placeKey = (p) => String(p || '').trim().toLowerCase();
+const places = () => st.places || {};
+function rememberPlace(a) {
+  if (!a.place || (a.travelTo == null && a.travelBack == null)) return;
+  (st.places || (st.places = {}))[placeKey(a.place)] = { name: a.place, travelTo: a.travelTo, travelBack: a.travelBack };
+}
+function travelLine(a) {
+  if (a.travelTo == null && a.travelBack == null) return '';
+  const p = [a.travelTo != null ? `hin ${a.travelTo} Min.` : '', a.travelBack != null ? `zurück ${a.travelBack} Min.` : ''].filter(Boolean).join(' · ');
+  return `<div class="small muted">Fahrzeit ${p} – ${a.travelSrc === 'ort' ? `für „${esc(a.place)}“ gespeichert (von dir eingegeben)` : 'von dir eingegeben'}</div>`;
 }
 
 /* ---------- Ergebnis-Darstellung (neutral: keine Wertung, was wichtiger ist) ---------- */
@@ -2400,43 +2544,56 @@ function dayTimeline(ref, o) {
   }).join('');
   return `<details class="small" ${o.conflicts.length ? 'open' : ''}><summary>Tagesverlauf ${esc(A.fmtDate(o.d, false))}</summary><div class="tlist">${rows}</div></details>`;
 }
-function occTable(chk) {
-  return `<div class="table-scroll"><table class="data"><thead><tr><th>Datum</th><th>KW</th><th>Ergebnis</th></tr></thead><tbody>
-    ${chk.occ.map(o => `<tr><td class="mono">${esc(A.fmtDate(o.d))}</td><td class="mono">${o.key % 100}</td><td>${slotStatus(o)} ${o.conflicts.map(c => `<span class="small">${esc(evName(c.e))} ${t2(c.from, c.to)}</span>`).join(', ')}</td></tr>`).join('')}
-  </tbody></table></div>`;
+const fmtD = (d) => A.fmtDate(d).replace(/\.\d{4}$/, '.');
+function sugHtml(a, ref, target) {
+  const sug = A.suggest(ref.evs, a, activeAppts(), ref.sem, { max: 3 });
+  if (!sug.length) return '<div class="small muted">In den nächsten 7 Tagen keine passende freie Zeit gefunden.</div>';
+  return `<div class="row small" style="gap:6px"><span>Passt stattdessen:</span>${sug.map(x => `<button class="btn sm" data-act="ap-sug" data-target="${target}" data-date="${x.date}" data-s="${x.start}" data-e="${x.end}">${esc(fmtD(x.d))} ${t2(x.start, x.end)}${x.status === 'tight' ? ' (knapp)' : ''}</button>`).join('')}</div>`;
 }
-function checkHtml(a, ref) {
-  const chk = apptCheck(a, ref);
-  if (!chk.occ.length) return '<p class="small muted">Keine Termine in diesem Zeitraum.</p>';
-  if (chk.occ.length === 1) return slotDetail(chk.occ[0], ref, a.id ? a : null);
-  const n = chk.conflictDays;
-  return `<div class="stack" style="gap:8px"><div>${n ? `<span class="pill bad">⚠ ${n} von ${chk.occ.length} Terminen mit Konflikt</span>` : `<span class="pill ok">✓ Alle ${chk.occ.length} Termine ohne Konflikt</span>`}</div>
-    ${occTable(chk)}
-    ${chk.occ.filter(o => o.conflicts.length).slice(0, 2).map(o => `<details class="small"><summary>${esc(A.fmtDate(o.d))} im Detail</summary>${slotDetail(o, ref, a.id ? a : null)}</details>`).join('')}</div>`;
+/** Kurz: Status + ein Satz Begründung. Alles andere nur auf Klick. */
+function checkHtml(a, ref, target = 'form') {
+  const fz = apptFeas(a, ref);
+  if (!fz.occ.length) return '<p class="small muted">Keine Termine in diesem Zeitraum.</p>';
+  const single = fz.occ.length === 1;
+  if (single) {
+    const r = fz.occ[0];
+    const chk = A.checkSlot(ref.evs, r, a.buffer ? { bufBefore: a.bufBefore, bufAfter: a.bufAfter } : {});
+    return `<div class="stack" style="gap:6px">
+      <div class="row" style="gap:8px">${feasPill(r.status)}<b>${esc(fmtD(r.d))}</b><span class="mono">${t2(r.start, r.end)}</span></div>
+      <div class="small">${esc(r.reason)}</div>
+      ${travelLine(a)}
+      ${r.status === 'bad' || r.status === 'tight' || (a.id && ui.apptMove === a.id) ? sugHtml(a, ref, target) : ''}
+      <details class="small"><summary>Details</summary>${slotDetail(chk, ref, a.id ? a : null)}</details></div>`;
+  }
+  const probs = fz.occ.filter(r => r.status !== 'ok');
+  const head = fz.bad ? `${feasPill('bad')} <b>${fz.bad} von ${fz.occ.length}</b> nicht machbar` : fz.unknown ? `${feasPill('unknown')} ${fz.unknown} von ${fz.occ.length} nicht prüfbar` : fz.tight ? `${feasPill('tight')} ${fz.tight} von ${fz.occ.length} knapp` : `${feasPill('ok')} alle ${fz.occ.length} Termine`;
+  return `<div class="stack" style="gap:6px"><div class="row" style="gap:8px">${head}</div>${travelLine(a)}
+    ${probs.length ? `<div class="tlist">${probs.slice(0, 8).map(r => `<div class="tl"><span class="mono">${esc(fmtD(r.d))}</span><span>${feasPill(r.status)} ${esc(r.reason)}</span></div>`).join('')}${probs.length > 8 ? `<div class="small muted">… und ${probs.length - 8} weitere</div>` : ''}</div>` : ''}</div>`;
 }
 function altLine(alt, ref, f) {
-  const a = { ...formToAppt({ ...f, date: alt.date, start: alt.start, end: alt.end, repeatType: 'none' }) };
+  const a = { ...formToAppt({ ...f, date: alt.date, start: alt.start, end: alt.end, repeatType: 'none' }), id: f.id };
   if (!A.parseYmd(alt.date) || a.start == null || a.end == null || a.end <= a.start) return '<span class="small muted">Datum und Zeit eingeben</span>';
-  const o = A.checkSlot(ref.evs, { date: alt.date, start: a.start, end: a.end }, a.buffer ? { bufBefore: a.bufBefore, bufAfter: a.bufAfter } : {});
-  return `${slotStatus(o)} ${o.conflicts.length ? `<span class="small">mit ${esc(o.conflicts.map(c => `${evName(c.e)} (${t2(c.from, c.to)})`).join(', '))}</span>` : `<span class="small muted">${o.dayFree ? 'Tag frei' : 'zwischen deinen Veranstaltungen'}</span>`}`;
+  const r = A.feasibility(ref.evs, a, { date: alt.date, start: a.start, end: a.end }, activeAppts(), ref.sem);
+  return `${feasPill(r.status)} <span class="small">${esc(r.reason)}</span>`;
 }
 
 /* ---------- Ansicht ---------- */
 function viewAppts() {
   const ref = refInfo();
   const f = form();
-  const intro = `<div class="lead"><h1>Termin-Check</h1>
-    <p class="muted">Prüfe persönliche Termine – Arzt, Amt, Bewerbung, Arbeit – gegen deinen Stundenplan, am konkreten Datum und in der richtigen Kalenderwoche. Die App zeigt Überschneidungen und freie Zeiten. <b>Entscheiden tust du.</b></p>
-    <p class="small muted">Persönliche Termine ändern weder deinen Stundenplan noch die Berechnung. Feste Sperrzeiten, die der Optimierer beachten soll (z. B. „jeden Dienstag 16–18 Uhr“), stellst du unter <a href="#" data-act="tab" data-id="wuensche">Wünsche</a> ein.</p></div>`;
-  if (!ref) return intro + `<div class="alert info"><b>Noch kein Stundenplan zum Prüfen.</b><span>Öffne unter „Pläne“ einen Plan oder speichere einen. Danach prüft der Termin-Check gegen genau diesen Plan.</span><div><button class="btn primary" data-act="tab" data-id="plaene">Zu den Plänen</button></div></div>`;
+  const intro = `<div class="lead"><h1>Termine</h1>
+    <p class="muted">Prüft, ob du einen Termin schaffst – mit Fahrzeit, Puffer und allem, was davor und danach ansteht. Geändert wird nichts ohne dich.</p></div>`;
+  if (!ref) return intro + `<div class="alert info"><b>Noch kein Stundenplan zum Prüfen.</b><span>Öffne unter „Pläne“ einen Plan oder speichere einen.</span><div><button class="btn primary" data-act="tab" data-id="plaene">Zu den Plänen</button></div></div>`;
   const prob = formProblem(f);
   const draft = prob ? null : formToAppt(f);
+  const dur = !prob ? C.toMin(f.end) - C.toMin(f.start) : 0;
+  const rep = f.repeatType;
+  const plist = Object.values(places());
   return intro + `
-  <section class="panel" style="gap:8px"><label class="field">Geprüft gegen
-    <select id="ap-ref">${ref.opts.map(o => `<option value="${o.id}" ${o.id === ref.id ? 'selected' : ''}>${esc(o.label)}</option>`).join('')}</select></label>
-    <span class="small muted">${ref.evs.length} Veranstaltungstermine in diesem Plan.${ref.id === 'open' && ui.plan && JSON.stringify(ui.plan.sel) !== JSON.stringify(ui.plan.baseSel) ? ' Enthält deine ungespeicherten Gruppenwechsel.' : ''} Wechselst du im geöffneten Plan eine Gruppe, wird hier sofort neu geprüft.</span></section>
+  <section class="panel" style="gap:6px"><label class="field">Geprüft gegen
+    <select id="ap-ref">${ref.opts.map(o => `<option value="${o.id}" ${o.id === ref.id ? 'selected' : ''}>${esc(o.label)}</option>`).join('')}</select></label></section>
   <div class="grid-2" id="ap-form-anchor">
-    <section class="panel"><div class="row between"><h2>${f.id ? 'Termin ändern' : 'Termin prüfen'}</h2>${f.id ? '<button class="btn ghost sm" data-act="ap-new">Neuer Termin</button>' : ''}</div>
+    <section class="panel"><div class="row between"><h2>${f.id ? 'Termin bearbeiten' : 'Neuer Termin'}</h2>${f.id ? '<button class="btn ghost sm" data-act="ap-new">Neuer Termin</button>' : ''}</div>
       <div class="row">
         <label class="field" style="flex:2;min-width:180px">Titel<input type="text" id="af-title" value="${esc(f.title)}" placeholder="z. B. Arzttermin"></label>
         <label class="field" style="flex:1;min-width:150px">Kategorie<select id="af-category">${A.CATEGORIES.map(c => `<option ${c === f.category ? 'selected' : ''}>${c}</option>`).join('')}</select></label>
@@ -2445,25 +2602,35 @@ function viewAppts() {
         <label class="field">Datum<input type="date" id="af-date" value="${esc(f.date)}"></label>
         <label class="field">Beginn<input type="time" id="af-start" value="${esc(f.start)}"></label>
         <label class="field">Ende<input type="time" id="af-end" value="${esc(f.end)}"></label>
+        <span class="small muted" id="af-dur" style="align-self:end;padding-bottom:10px">${dur > 0 ? 'Dauer ' + C.fmtDur(dur) : ''}</span>
       </div>
-      <details ${f.place || f.note || f.repeatType !== 'none' || f.priority || f.buffer ? 'open' : ''}><summary class="small">Mehr: Ort, Notiz, Wiederholung, Puffer</summary>
+      <div class="row">
+        <label class="field" style="flex:2;min-width:180px">Ort / Adresse<input type="text" id="af-place" list="af-places" value="${esc(f.place)}" placeholder="z. B. Praxis Dr. Meier, Hauptstr. 5"></label>
+        <datalist id="af-places">${plist.map(x => `<option value="${esc(x.name)}"></option>`).join('')}</datalist>
+        <label class="field">Fahrzeit hin (Min.)<input type="number" id="af-travelTo" min="0" max="600" step="5" value="${esc(f.travelTo)}" placeholder="?" style="width:110px"></label>
+        <label class="field">Rückfahrt (Min.)<input type="number" id="af-travelBack" min="0" max="600" step="5" value="${esc(f.travelBack)}" placeholder="?" style="width:110px"></label>
+      </div>
+      <p class="small muted" style="margin:0">Fahrzeit selbst eintragen (z. B. aus der HVV-App). Leer = unbekannt. Für denselben Ort merkt sich die App sie.</p>
+      <details ${f.note || rep !== 'none' || f.priority || +f.bufBefore || +f.bufAfter || +f.remind ? 'open' : ''}><summary class="small">Mehr: Puffer, Wiederholung, Erinnerung, Notiz</summary>
         <div class="stack" style="margin-top:8px">
-          <div class="row"><label class="field" style="flex:1;min-width:160px">Ort (optional)<input type="text" id="af-place" value="${esc(f.place)}"></label>
-            <label class="field">Kennzeichnung (nur für dich)<select id="af-priority">${A.PRIORITIES.map(p => `<option value="${p}" ${p === f.priority ? 'selected' : ''}>${p ? 'Priorität ' + p : '–'}</option>`).join('')}</select></label></div>
-          <label class="field">Notiz (optional)<input type="text" id="af-note" value="${esc(f.note)}"></label>
-          <div class="row"><label class="field">Wiederholung<select id="af-repeatType"><option value="none" ${f.repeatType === 'none' ? 'selected' : ''}>einmalig</option><option value="weekly" ${f.repeatType === 'weekly' ? 'selected' : ''}>wöchentlich</option><option value="weeks" ${f.repeatType === 'weeks' ? 'selected' : ''}>nur in bestimmten KW</option></select></label>
-            ${f.repeatType === 'weekly' ? `<label class="field">bis einschließlich<input type="date" id="af-until" value="${esc(f.until)}"></label>` : ''}
-            ${f.repeatType === 'weeks' ? `<label class="field" style="flex:1;min-width:150px">Kalenderwochen<input type="text" class="mono" id="af-weeksRaw" value="${esc(f.weeksRaw)}" placeholder="43,45-47,1-3"></label>` : ''}</div>
-          <div class="row"><label class="row small" style="gap:6px"><input type="checkbox" id="af-buffer" ${f.buffer ? 'checked' : ''}> Puffer für An-/Abreise mitprüfen</label>
-            ${f.buffer ? `<label class="field">vorher (min)<input type="number" id="af-bufBefore" min="0" max="240" step="5" value="${esc(f.bufBefore)}" style="width:90px"></label><label class="field">danach (min)<input type="number" id="af-bufAfter" min="0" max="240" step="5" value="${esc(f.bufAfter)}" style="width:90px"></label>` : ''}</div>
+          <div class="row"><label class="field">Puffer vorher (Min.)<input type="number" id="af-bufBefore" min="0" max="240" step="5" value="${esc(f.bufBefore)}" style="width:110px"></label>
+            <label class="field">Puffer danach (Min.)<input type="number" id="af-bufAfter" min="0" max="240" step="5" value="${esc(f.bufAfter)}" style="width:110px"></label>
+            <label class="field">Erinnerung<select id="af-remind">${[[0, 'keine'], [15, '15 Min. vorher'], [30, '30 Min. vorher'], [60, '1 Std. vorher'], [120, '2 Std. vorher'], [1440, '1 Tag vorher']].map(([v, l]) => `<option value="${v}" ${+f.remind === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label></div>
+          ${+f.remind ? '<p class="small muted" style="margin:0">Die Erinnerung kommt von deinem Kalender – sie wird beim Kalender-Export (Datei .ics) mitgegeben.</p>' : ''}
+          <div class="row"><label class="field">Wiederholung<select id="af-repeatType">${[['none', 'einmalig'], ['daily', 'täglich'], ['weekly', 'wöchentlich'], ['monthly', 'monatlich'], ['weeks', 'nur in bestimmten KW']].map(([v, l]) => `<option value="${v}" ${rep === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+            ${['daily', 'weekly', 'monthly'].includes(rep) ? `<label class="field">bis einschließlich<input type="date" id="af-until" value="${esc(f.until)}"></label>` : ''}
+            ${rep === 'weeks' ? `<label class="field" style="flex:1;min-width:150px">Kalenderwochen<input type="text" class="mono" id="af-weeksRaw" value="${esc(f.weeksRaw)}" placeholder="43,45-47,1-3"></label>` : ''}</div>
+          <div class="row"><label class="field" style="flex:1;min-width:160px">Notiz<input type="text" id="af-note" value="${esc(f.note)}"></label>
+            <label class="field">Kennzeichnung<select id="af-priority">${A.PRIORITIES.map(p => `<option value="${p}" ${p === f.priority ? 'selected' : ''}>${p ? 'Priorität ' + p : '–'}</option>`).join('')}</select></label></div>
         </div></details>
-      <div class="row"><button class="btn primary" data-act="ap-save" ${prob ? 'disabled' : ''}>${f.id ? 'Änderungen speichern' : 'Termin speichern'}</button>${f.id ? '<button class="btn" data-act="ap-new">Abbrechen</button>' : ''}<span class="small muted">Geprüft wird schon beim Tippen – speichern ist optional.</span></div>
-      <div class="hr"></div>
-      <div class="row between"><h3>Andere Zeit prüfen</h3><button class="btn sm" data-act="ap-alt-add">+ Zeit hinzufügen</button></div>
-      ${f.alts.length ? f.alts.map((al, i) => `<div class="stack" style="gap:4px;border-top:1px solid var(--line-soft);padding-top:8px">
-        <div class="row"><input type="date" id="alt-${i}-date" value="${esc(al.date)}" aria-label="Datum Alternative ${i + 1}"><input type="time" id="alt-${i}-start" value="${esc(al.start)}" aria-label="Beginn"><input type="time" id="alt-${i}-end" value="${esc(al.end)}" aria-label="Ende">
-          <button class="btn ghost sm" data-act="ap-alt-use" data-i="${i}">Diese Zeit übernehmen</button><button class="btn ghost sm danger" data-act="ap-alt-del" data-i="${i}" aria-label="entfernen">×</button></div>
-        <div id="alt-res-${i}">${altLine(al, ref, f)}</div></div>`).join('') : '<p class="small muted">Vergleiche weitere Zeiten, bevor du buchst – z. B. 14:00–16:00 statt 10:00–12:00.</p>'}
+      <div class="row"><button class="btn primary" data-act="ap-save" ${prob ? 'disabled' : ''}>${f.id ? 'Änderungen speichern' : 'Termin speichern'}</button>${f.id ? '<button class="btn" data-act="ap-new">Abbrechen</button>' : ''}</div>
+      <details ${f.alts.length ? 'open' : ''}><summary class="small">Andere Zeit vergleichen</summary>
+        <div class="stack" style="gap:6px;margin-top:6px">
+        ${f.alts.map((al, i) => `<div class="stack" style="gap:4px;border-top:1px solid var(--line-soft);padding-top:8px">
+          <div class="row"><input type="date" id="alt-${i}-date" value="${esc(al.date)}" aria-label="Datum Alternative ${i + 1}"><input type="time" id="alt-${i}-start" value="${esc(al.start)}" aria-label="Beginn"><input type="time" id="alt-${i}-end" value="${esc(al.end)}" aria-label="Ende">
+            <button class="btn ghost sm" data-act="ap-alt-use" data-i="${i}">Übernehmen</button><button class="btn ghost sm danger" data-act="ap-alt-del" data-i="${i}" aria-label="entfernen">×</button></div>
+          <div id="alt-res-${i}">${altLine(al, ref, f)}</div></div>`).join('')}
+        <div><button class="btn sm" data-act="ap-alt-add">+ Zeit hinzufügen</button></div></div></details>
     </section>
     <section class="panel" id="appt-result">${resultPanelInner(ref, f, prob, draft)}</section>
   </div>
@@ -2473,44 +2640,50 @@ function viewAppts() {
 function resultPanelInner(ref, f, prob, draft) {
   if (prob) return `<h2>Ergebnis</h2><p class="muted">${esc(prob)}</p>`;
   const a = { ...draft, id: f.id };
-  return `<h2>Ergebnis</h2><div class="small muted">${esc(draft.title)}${draft.place ? ' · ' + esc(draft.place) : ''}</div>${checkHtml(a, ref)}`;
+  return `<h2>Ergebnis</h2>${checkHtml(a, ref, 'form')}`;
 }
 function refreshResult() {
   const ref = refInfo(); const f = form(); const prob = formProblem(f);
   const el = $('#appt-result'); if (el) el.innerHTML = resultPanelInner(ref, f, prob, prob ? null : formToAppt(f));
+  const du = $('#af-dur'); if (du) { const d = prob ? 0 : C.toMin(f.end) - C.toMin(f.start); du.textContent = d > 0 ? 'Dauer ' + C.fmtDur(d) : ''; }
   const save = document.querySelector('[data-act=ap-save]'); if (save) save.disabled = !!prob;
   f.alts.forEach((al, i) => { const r = $('#alt-res-' + i); if (r) r.innerHTML = altLine(al, ref, f); });
 }
 
-/* ---------- Liste + Entscheidung ---------- */
+/* ---------- Liste ---------- */
 function apptListHtml(ref) {
-  const list = apptsAll().slice().sort((a, b) => (a.date + C.fmt(a.start)).localeCompare(b.date + C.fmt(b.start)));
-  if (!list.length) return `<section class="panel"><h2>Meine Termine</h2><p class="muted small">Noch keine gespeicherten Termine. Gespeicherte Termine werden bei jeder Planänderung automatisch neu geprüft.</p></section>`;
+  const all = apptsAll().slice().sort((a, b) => (a.date + C.fmt(a.start)).localeCompare(b.date + C.fmt(b.start)));
+  if (!all.length) return `<section class="panel"><h2>Meine Termine</h2><p class="muted small">Noch keine gespeicherten Termine.</p></section>`;
+  const open = all.filter(a => !a.done), done = all.filter(a => a.done);
   const today = todayYmd();
   return `<section class="panel"><div class="row between"><h2>Meine Termine</h2><label class="row small" style="gap:6px"><input type="checkbox" id="ap-show" ${st.showAppts !== false ? 'checked' : ''}> im Kalender anzeigen</label></div>
-    <div class="stack" style="gap:10px">${list.map(a => apptRow(a, ref, a.date < today && (!a.repeat || a.repeat.type === 'none'))).join('')}</div></section>`;
+    <div class="stack" style="gap:10px">${open.map(a => apptRow(a, ref, a.date < today && (!a.repeat || a.repeat.type === 'none'))).join('') || '<p class="small muted">Keine offenen Termine.</p>'}</div>
+    ${done.length ? `<details class="small"><summary>Erledigt (${done.length})</summary><div class="stack" style="gap:8px;margin-top:8px">${done.map(a => apptRow(a, ref, true)).join('')}</div></details>` : ''}</section>`;
 }
 function apptRow(a, ref, past) {
-  const chk = apptCheck(a, ref); const pc = personalConflictsOf(a, ref);
+  const fz = apptFeas(a, ref);
   const open = ui.apptOpen === a.id;
-  const when = a.repeat && a.repeat.type !== 'none' ? `${chk.occ.length}× · ab ${A.fmtDate(A.parseYmd(a.date))}` : A.fmtDate(A.parseYmd(a.date));
-  const status = chk.conflictCount ? `<span class="pill bad">⚠ ${chk.conflictCount === 1 ? '1 Konflikt' : chk.conflictCount + ' Konflikte'}</span>` : chk.bufferCount ? '<span class="pill warn">⚠ Pufferzeit</span>' : '<span class="pill ok">✓ kein Konflikt</span>';
-  const dec = a.decision ? `<span class="pill ${a.decision === 'take' ? 'sig' : ''}">${DEC[a.decision]}</span>` : '<span class="pill">noch nicht entschieden</span>';
-  const hits = [...new Set(chk.occ.flatMap(o => o.conflicts.map(c => `${evName(c.e)} ${t2(c.e.start, c.e.end)}`)))];
+  const when = a.repeat && a.repeat.type !== 'none' ? `${fz.occ.length}× ab ${fmtD(A.parseYmd(a.date))}` : fmtD(A.parseYmd(a.date));
+  const first = fz.occ.find(r => r.status === fz.status) || fz.occ[0];
+  const uniHit = fz.occ.flatMap(r => r.overlaps.filter(o => o.kind === 'uni').map(o => o.group && o.group !== o.label ? `${o.label} (${o.group})` : o.label));
+  const hits = [...new Set(uniHit)];
   return `<div class="appt ${past ? 'past' : ''} ${open ? 'open' : ''}" id="appt-${a.id}">
-    <div class="row between"><div><b>${esc(a.title)}</b> <span class="small muted">· ${esc(a.category)}${a.priority ? ' · Priorität ' + esc(a.priority) : ''}</span>
+    <div class="row between"><div><b>${esc(a.title)}</b>
       <div class="small mono">${esc(when)} · ${t2(a.start, a.end)}${a.place ? ' · ' + esc(a.place) : ''}</div></div>
-      <div class="row" style="gap:6px">${status}${pc.length ? '<span class="pill warn">⚠ persönlicher Konflikt</span>' : ''}${dec}</div></div>
-    ${a.decision === 'take' && hits.length ? `<div class="alert warn small"><span>Du hast dich dafür entschieden, den persönlichen Termin wahrzunehmen. Dadurch überschneidet sich der Termin mit ${esc(hits.join(', '))}.</span><span class="muted">Dieser Hochschultermin wird aufgrund deiner persönlichen Entscheidung voraussichtlich verpasst. Dein Stundenplan bleibt unverändert.</span></div>` : ''}
+      <div class="row" style="gap:6px">${a.done ? '<span class="pill">✓ Erledigt</span>' : feasPill(fz.status)}${a.decision ? `<span class="pill ${a.decision === 'take' ? 'sig' : ''}">${DEC[a.decision]}</span>` : ''}</div></div>
+    ${!a.done && first && fz.status !== 'ok' ? `<div class="small">${esc(first.reason)}${fz.occ.length > 1 ? ` <span class="muted">(${esc(fmtD(first.d))})</span>` : ''}</div>` : ''}
+    ${a.decision === 'take' && hits.length ? `<div class="small muted">Du nimmst ihn wahr – „${esc(hits.join('“, „'))}“ verpasst du dann voraussichtlich. Dein Stundenplan bleibt unverändert.</div>` : ''}
     ${a.decisionNote ? `<div class="small muted">${esc(a.decisionNote)}</div>` : ''}
     <div class="row" style="gap:6px">
-      <button class="btn sm ${a.decision === 'take' ? 'primary' : ''}" data-act="ap-take" data-id="${a.id}">Termin wahrnehmen</button>
-      <button class="btn sm ${a.decision === 'skip' ? 'primary' : ''}" data-act="ap-skip" data-id="${a.id}">Termin nicht wahrnehmen</button>
-      <button class="btn sm" data-act="ap-edit" data-id="${a.id}">Zeit ändern</button>
-      <button class="btn ghost sm" data-act="ap-toggle" data-id="${a.id}">${open ? 'Prüfung ausblenden' : 'Termin prüfen'}</button>
+      ${a.done ? `<button class="btn sm" data-act="ap-done" data-id="${a.id}">Wieder öffnen</button>` : `
+      <button class="btn sm" data-act="ap-edit" data-id="${a.id}">Bearbeiten</button>
+      <button class="btn sm" data-act="ap-move" data-id="${a.id}">Verschieben</button>
+      <button class="btn sm" data-act="ap-done" data-id="${a.id}">Erledigt</button>
+      ${hits.length || a.decision ? `<button class="btn sm ${a.decision === 'take' ? 'primary' : ''}" data-act="ap-take" data-id="${a.id}">Wahrnehmen</button><button class="btn sm ${a.decision === 'skip' ? 'primary' : ''}" data-act="ap-skip" data-id="${a.id}">Nicht wahrnehmen</button>` : ''}
+      <button class="btn ghost sm" data-act="ap-toggle" data-id="${a.id}">${open ? 'Weniger' : 'Prüfung'}</button>`}
       ${ui.apptDel === a.id ? `<button class="btn sm danger" data-act="ap-del-yes" data-id="${a.id}">Wirklich löschen</button><button class="btn ghost sm" data-act="ap-del-no">Behalten</button>` : `<button class="btn ghost sm danger" data-act="ap-del" data-id="${a.id}">Löschen</button>`}
     </div>
-    ${open ? `<div class="appt-detail">${checkHtml(a, ref)}</div>` : ''}
+    ${open && !a.done ? `<div class="appt-detail">${checkHtml(a, ref, a.id)}</div>` : ''}
   </div>`;
 }
 
@@ -2522,15 +2695,15 @@ function fwState(ref) {
     const nowKey = A.isoKey(A.parseYmd(todayYmd()));
     const k = keys.find(x => x >= nowKey) || keys[0];
     const start = k ? C.dateOf(k, 0) : mondayOf(A.parseYmd(todayYmd()));
-    ui.fw = { start: A.ymd(start), from: '08:00', to: '18:00', dur: 60, buf: 0, weekend: false, personal: true };
+    ui.fw = { start: A.ymd(start), from: '08:00', to: '18:00', dur: 60, buf: 0, travel: 0, weekend: false, personal: true };
   }
   return ui.fw;
 }
 function freePanelHtml(ref) {
   const fw = fwState(ref);
   const from = C.toMin(fw.from) ?? 480, to = C.toMin(fw.to) ?? 1080;
-  const personal = fw.personal ? apptsAll().filter(a => a.decision !== 'skip').flatMap(a => A.occurrences(a, ref.sem).map(o => ({ ...o, a }))) : [];
-  const days = A.freeWindows(ref.evs, fw.start, 7, from, to, +fw.dur || 60, { buffer: +fw.buf || 0, weekend: fw.weekend, personal });
+  const personal = fw.personal ? activeAppts().flatMap(a => A.occurrences(a, ref.sem).map(o => ({ ...o, a }))) : [];
+  const days = A.freeWindows(ref.evs, fw.start, 7, from, to, +fw.dur || 60, { buffer: (+fw.buf || 0) + (+fw.travel || 0), weekend: fw.weekend, personal });
   const d0 = A.parseYmd(fw.start);
   return `<section class="panel"><div class="row between"><h2>Freie Zeiten finden</h2>
       <div class="row" style="gap:6px"><button class="btn sm" data-act="fw-week" data-v="-7" aria-label="Woche zurück">←</button><b class="mono">KW ${A.isoKey(d0) % 100} · ab ${esc(A.fmtDate(d0, false))}</b><button class="btn sm" data-act="fw-week" data-v="7" aria-label="Woche vor">→</button></div></div>
@@ -2539,14 +2712,15 @@ function freePanelHtml(ref) {
       <label class="field">von<input type="time" id="fw-from" value="${esc(fw.from)}"></label>
       <label class="field">bis<input type="time" id="fw-to" value="${esc(fw.to)}"></label>
       <label class="field">Dauer mindestens<select id="fw-dur">${[30, 45, 60, 90, 120, 180].map(m => `<option value="${m}" ${+fw.dur === m ? 'selected' : ''}>${C.fmtDur(m)}</option>`).join('')}</select></label>
+      <label class="field">Fahrzeit je Richtung<select id="fw-travel">${[0, 10, 15, 20, 30, 45, 60].map(m => `<option value="${m}" ${+(fw.travel || 0) === m ? 'selected' : ''}>${m ? m + ' min' : 'keine'}</option>`).join('')}</select></label>
       <label class="field">Puffer<select id="fw-buf">${[0, 15, 30, 45, 60].map(m => `<option value="${m}" ${+fw.buf === m ? 'selected' : ''}>${m ? m + ' min' : 'keiner'}</option>`).join('')}</select></label>
     </div>
     <div class="row small"><label class="row" style="gap:6px"><input type="checkbox" id="fw-personal" ${fw.personal ? 'checked' : ''}> meine gespeicherten Termine als belegt zählen</label><label class="row" style="gap:6px"><input type="checkbox" id="fw-weekend" ${fw.weekend ? 'checked' : ''}> Wochenende einbeziehen</label></div>
     <div class="fwgrid">${days.map(day => `<div class="fwday"><div class="row between"><b>${esc(A.fmtDate(day.d))}</b><span class="small muted">${day.windows.length ? day.windows.length + ' passend' : 'nichts passend'}</span></div>
       <div class="tlist">${day.segs.map(s => s.kind === 'free'
-        ? `<div class="tl free ${s.usable >= (+fw.dur || 60) ? 'fit' : 'short'}"><span class="mono">${t2(s.start, s.end)}</span><span>${s.usable >= (+fw.dur || 60) ? `✓ frei (${C.fmtDur(s.end - s.start)})${+fw.buf ? ` · nutzbar ${t2(s.useStart, s.useEnd)}` : ''} <button class="btn ghost sm" data-act="fw-use" data-date="${day.date}" data-s="${s.useStart}">prüfen</button>` : `frei, aber kürzer als ${C.fmtDur(+fw.dur || 60)}`}</span></div>`
+        ? `<div class="tl free ${s.usable >= (+fw.dur || 60) ? 'fit' : 'short'}"><span class="mono">${t2(s.start, s.end)}</span><span>${s.usable >= (+fw.dur || 60) ? `✓ frei (${C.fmtDur(s.end - s.start)})${(+fw.buf || +fw.travel) && s.useEnd > s.useStart && (s.useStart !== s.start || s.useEnd !== s.end) ? ` · nutzbar ${t2(s.useStart, s.useEnd)}` : ''} <button class="btn ghost sm" data-act="fw-use" data-date="${day.date}" data-s="${s.useStart}">prüfen</button>` : `frei, aber kürzer als ${C.fmtDur(+fw.dur || 60)}`}</span></div>`
         : `<div class="tl ${s.kind === 'uni' ? 'uni' : 'pers'}"><span class="mono">${t2(s.start, s.end)}</span><span>${s.kind === 'uni' ? '✗ Hochschule' : s.kind === 'personal' ? '✗ persönlich' : '✗ Hochschule + persönlich'}: ${esc(s.labels.join(', '))}</span></div>`).join('')}</div></div>`).join('')}</div>
-    <p class="small muted">Es zählen nur Veranstaltungen, die in der jeweiligen Kalenderwoche wirklich stattfinden.</p>
+    <p class="small muted">Nutzbar = frei abzüglich Fahrzeit und Puffer zu den Terminen davor/danach. Es zählen nur Veranstaltungen, die in der jeweiligen KW stattfinden.</p>
   </section>`;
 }
 
@@ -2556,16 +2730,17 @@ function saveAppt() {
   const data = formToAppt(f); const now = new Date().toISOString(); const ref = refInfo();
   let a = f.id && apptsAll().find(x => x.id === f.id);
   if (a) {
-    const timeChanged = a.date !== data.date || a.start !== data.start || a.end !== data.end || JSON.stringify(a.repeat) !== JSON.stringify(data.repeat) || a.buffer !== data.buffer;
+    const timeChanged = a.date !== data.date || a.start !== data.start || a.end !== data.end || JSON.stringify(a.repeat) !== JSON.stringify(data.repeat) || a.buffer !== data.buffer || a.travelTo !== data.travelTo || a.travelBack !== data.travelBack;
     Object.assign(a, data, { updatedAt: now });
-    if (timeChanged && a.decision && ref && apptCheck(a, ref).conflictCount) { a.decision = null; a.decisionNote = 'Zeit geändert – bitte neu entscheiden. Die alte Prüfung gilt nicht mehr.'; }
+    if (timeChanged && a.decision) { a.decision = null; a.decisionNote = 'Geändert – bitte neu entscheiden.'; }
     else if (timeChanged) a.decisionNote = '';
     toast('Termin geändert und neu geprüft.');
   } else {
-    a = { id: C.uid('ap'), ...data, decision: null, createdAt: now, updatedAt: now };
-    apptsAll().push(a); toast('Termin gespeichert – entscheide unten, ob du ihn wahrnimmst.');
+    a = { id: C.uid('ap'), ...data, decision: null, done: false, createdAt: now, updatedAt: now };
+    apptsAll().push(a); toast('Termin gespeichert.');
   }
-  ui.apptOpen = a.id; ui.apptForm = newForm({ date: f.date }); changed(); render();
+  rememberPlace(a);
+  ui.apptOpen = null; ui.apptMove = null; ui.apptForm = newForm({ date: f.date }); changed(); render();
   const el = document.getElementById('appt-' + a.id); el && el.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 function decide(id, d) {
@@ -2579,17 +2754,25 @@ function onApptClick(act, a) {
   const id = a.dataset.id;
   switch (act) {
     case 'ap-save': saveAppt(); return true;
-    case 'ap-new': ui.apptForm = newForm(); render(); return true;
+    case 'ap-new': ui.apptForm = newForm(); ui.apptMove = null; render(); return true;
+    case 'ap-move': { const x = apptsAll().find(y => y.id === id); if (!x) return true; ui.apptForm = apptToForm(x); ui.apptMove = id; render(); const el = $('#ap-form-anchor'); el && el.scrollIntoView({ behavior: 'smooth' }); return true; }
+    case 'ap-sug': { // Vorschlag ins Formular eintragen – gespeichert wird erst, wenn du speicherst
+      const tgt = a.dataset.target;
+      if (tgt && tgt !== 'form') { const x = apptsAll().find(y => y.id === tgt); if (x) { ui.apptForm = apptToForm(x); ui.apptMove = tgt; } }
+      Object.assign(form(), { date: a.dataset.date, start: C.fmt(+a.dataset.s), end: C.fmt(+a.dataset.e), repeatType: form().repeatType === 'none' ? 'none' : form().repeatType });
+      render(); const el = $('#ap-form-anchor'); el && el.scrollIntoView({ behavior: 'smooth' });
+      toast(form().id ? 'Neue Zeit eingetragen – mit „Änderungen speichern“ übernehmen.' : 'Zeit eingetragen.'); return true; }
+    case 'ap-done': { const x = apptsAll().find(y => y.id === id); if (!x) return true; x.done = !x.done; x.doneAt = x.done ? new Date().toISOString() : null; changed(); render(); toast(x.done ? 'Als erledigt markiert.' : 'Wieder offen.'); return true; }
     case 'ap-alt-add': { const f = form(); f.alts.push({ date: f.date, start: '14:00', end: C.fmt((C.toMin('14:00')) + Math.max(15, (C.toMin(f.end) || 0) - (C.toMin(f.start) || 0) || 60)) }); render(); return true; }
     case 'ap-alt-del': form().alts.splice(+a.dataset.i, 1); render(); return true;
     case 'ap-alt-use': { const f = form(); const al = f.alts[+a.dataset.i]; f.alts[+a.dataset.i] = { date: f.date, start: f.start, end: f.end }; Object.assign(f, { date: al.date, start: al.start, end: al.end, repeatType: 'none' }); render(); toast('Zeit übernommen – die bisherige steht jetzt bei „Andere Zeit prüfen“.'); return true; }
     case 'ap-take': decide(id, 'take'); return true;
     case 'ap-skip': decide(id, 'skip'); return true;
-    case 'ap-edit': { const x = apptsAll().find(y => y.id === id); ui.apptForm = apptToForm(x); render(); const el = $('#ap-form-anchor'); el && el.scrollIntoView({ behavior: 'smooth' }); return true; }
+    case 'ap-edit': { const x = apptsAll().find(y => y.id === id); ui.apptForm = apptToForm(x); ui.apptMove = null; render(); const el = $('#ap-form-anchor'); el && el.scrollIntoView({ behavior: 'smooth' }); return true; }
     case 'ap-toggle': ui.apptOpen = ui.apptOpen === id ? null : id; render(); return true;
     case 'ap-del': ui.apptDel = id; render(); return true;
     case 'ap-del-no': ui.apptDel = null; render(); return true;
-    case 'ap-del-yes': st.appointments = apptsAll().filter(x => x.id !== id); ui.apptDel = null; if (ui.apptForm && ui.apptForm.id === id) ui.apptForm = newForm(); changed(); render(); toast('Termin gelöscht – damit verschwinden auch seine Konflikte.'); return true;
+    case 'ap-del-yes': st.appointments = apptsAll().filter(x => x.id !== id); ui.apptDel = null; if (ui.apptForm && ui.apptForm.id === id) ui.apptForm = newForm(); changed(); render(); toast('Termin gelöscht.'); return true;
     case 'ap-open': ui.tab = 'termine'; ui.apptOpen = id; render(); { const el = document.getElementById('appt-' + id); el && el.scrollIntoView({ behavior: 'smooth', block: 'center' }); } return true;
     case 'fw-week': { const fw = ui.fw; fw.start = A.ymd(A.addDays(A.parseYmd(fw.start), +a.dataset.v)); render(); return true; }
     case 'fw-use': { const fw = ui.fw; const s = +a.dataset.s; ui.apptForm = newForm({ ...form(), id: form().id, date: a.dataset.date, start: C.fmt(s), end: C.fmt(Math.min(s + (+fw.dur || 60), 24 * 60 - 1)) }); render(); const el = $('#ap-form-anchor'); el && el.scrollIntoView({ behavior: 'smooth' }); return true; }
@@ -2600,6 +2783,10 @@ function onApptInput(t) {
   if (t.id.startsWith('af-')) {
     const k = t.id.slice(3); const f = form();
     f[k] = t.type === 'checkbox' ? t.checked : t.value;
+    if (k === 'travelTo' || k === 'travelBack') f.travelSrc = '';
+    if (k === 'place') { const pl = places()[placeKey(t.value)]; if (pl && f.travelTo === '' && f.travelBack === '') {
+      f.travelTo = pl.travelTo == null ? '' : String(pl.travelTo); f.travelBack = pl.travelBack == null ? '' : String(pl.travelBack); f.travelSrc = 'ort';
+      const i1 = $('#af-travelTo'), i2 = $('#af-travelBack'); if (i1) i1.value = f.travelTo; if (i2) i2.value = f.travelBack; } }
     if (t.tagName === 'SELECT' || t.type === 'checkbox') render(); else refreshResult();
     return true;
   }
@@ -2616,8 +2803,8 @@ function apptItemsForKey(key, evs) {
   if (st.showAppts === false) return [];
   const sem = (evs[0] && evs[0].sem) || st.semesters[0];
   return apptsAll().flatMap(a => A.occurrences(a, sem).filter(o => o.key === key).map(o => {
-    const clash = evs.some(e => e.weekday === o.wd && e.keys.includes(key) && e.start < o.end && o.start < e.end);
-    return { id: 'ap_' + a.id + '_' + o.date, apptId: a.id, isAppt: true, weekday: o.wd, start: o.start, end: o.end, a, clash, keys: [key] };
+    const fz = a.done ? { status: 'ok' } : A.feasibility(evs, a, o, activeAppts(), sem);
+    return { id: 'ap_' + a.id + '_' + o.date, apptId: a.id, isAppt: true, weekday: o.wd, start: o.start, end: o.end, a, clash: fz.status === 'bad', tight: fz.status === 'tight', keys: [key] };
   }));
 }
 
@@ -2629,8 +2816,8 @@ function personalCalendarItems(lineId, evs) {
   for (const a of apptsAll().filter(x => x.decision !== 'skip')) for (const o of A.occurrences(a, sem)) {
     const day = o.date.replace(/-/g, '');
     const it = { uid: `${lineId}.pers.${String(a.id).replace(/[^A-Za-z0-9]/g, '')}.${day}@stundenplan-optimierer`, date: day, dateObj: o.d, key: o.key, weekday: o.wd, start: o.start, end: o.end,
-      summary: `Persönlich: ${a.title}`, location: a.place || '', description: `${a.category}${a.decision === 'take' ? ' · wird wahrgenommen' : ''}${a.note ? '\n' + a.note : ''}`, groupLabel: `Persönlich: ${a.title}`, personal: true };
-    it.hash = C.hashStr([it.start, it.end, it.summary, it.location, it.description].join('|'));
+      summary: `Persönlich: ${a.title}`, location: a.place || '', alarm: +a.remind || 0, description: `${a.category}${a.decision === 'take' ? ' · wird wahrgenommen' : ''}${a.note ? '\n' + a.note : ''}`, groupLabel: `Persönlich: ${a.title}`, personal: true };
+    it.hash = C.hashStr([it.start, it.end, it.summary, it.location, it.description].concat(it.alarm ? [it.alarm] : []).join('|'));
     out.push(it);
   }
   return out;
@@ -2659,7 +2846,7 @@ const Acct = {
   lsPlans() { try { const p = JSON.parse(localStorage.getItem(lsPlansKey()) || '[]'); return Array.isArray(p) ? p : []; } catch (e) { return []; } },
   setLsPlans(all) { try { localStorage.setItem(lsPlansKey(), JSON.stringify(all)); } catch (e) { /* */ } },
   /** ausstehende Änderungen sofort im aktuellen Bereich speichern (vor dem Wechsel des Kontos) */
-  saveLocalNow() { clearTimeout(Store.timer); try { localStorage.setItem(lsKey(), JSON.stringify(st)); } catch (e) { /* */ } },
+  saveLocalNow() { clearTimeout(Store.timer); Store.timer = null; try { localStorage.setItem(lsKey(), JSON.stringify(st)); } catch (e) { /* */ } },
   /** Daten des aktuellen Bereichs laden (Konto oder „ohne Konto“) – nie Daten eines anderen Bereichs */
   reloadNamespace() {
     st = normalize(Store.loadLocal() || freshState()); ui.saved = this.lsPlans();
@@ -2671,7 +2858,7 @@ const Acct = {
   clearUiData() {
     if (ui.lastDownload) { try { URL.revokeObjectURL(ui.lastDownload.url); } catch (e) { /* */ } }
     for (const k of ['results', 'plan', 'importPreview', 'alt', 'lastChange', 'lastDownload', 'exportError', 'editEvent', 'confirmDelete', 'confirmOff', 'wiConfirm',
-      'reviewSem', 'pdfReport', 'importNotes', 'parseError', 'parsing', 'apptForm', 'apptOpen', 'apptRef', 'apptDel', 'fw', 'check', 'anonConfirm', 'wipeConfirm', 'wipeMsg']) ui[k] = null;
+      'reviewSem', 'pdfReport', 'importNotes', 'parseError', 'parsing', 'apptForm', 'apptOpen', 'apptRef', 'apptDel', 'fw', 'check', 'anonConfirm', 'wipeConfirm', 'wipeMsg', 'apptMove']) ui[k] = null;
     ui.calOff = false; ui.calPreview = false; ui.semForm = false; ui.touched = false; ui.planKw = ''; ui.dismissed = new Set();
     this.conflicts = [];
   },
@@ -2698,7 +2885,7 @@ const Acct = {
     this.wiping = true; clearTimeout(this.timer);
     try {
       for (let k = 0; k < 100 && this.busy; k++) await new Promise(r => setTimeout(r, 100));
-      clearTimeout(Store.timer);
+      clearTimeout(Store.timer); Store.timer = null;
       const empty = { ...freshState(), resetAt: new Date().toISOString() };
       const res = await Cloud.wipe(empty);
       if (!Cloud.user() || Cloud.user().id !== uid) throw new Error('Die Anmeldung hat sich während des Zurücksetzens geändert – bitte erneut versuchen.');
@@ -3077,7 +3264,7 @@ const Store = {
   schedule() {
     this.status('Wird gespeichert …', 'pending');
     clearTimeout(this.timer);
-    this.timer = setTimeout(() => this.flush(), 700);
+    this.timer = setTimeout(() => { this.timer = null; this.flush(); }, 700);
   },
   async flush() {
     const data = JSON.parse(JSON.stringify(st));
@@ -3104,6 +3291,10 @@ const Store = {
   },
 };
 function changed() { ui.touched = true; ui.results && (ui.results.stale = true); Store.schedule(); }
+/* Beim Schließen, Neuladen oder Wechsel in eine andere App: ausstehende Änderung sofort auf dem Gerät speichern */
+function flushPending() { if (Store.timer) { clearTimeout(Store.timer); Store.timer = null; Store.flush(); } }
+window.addEventListener('pagehide', flushPending);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushPending(); });
 
 /* ---------- Zustand ---------- */
 function freshState() {
@@ -3757,7 +3948,7 @@ function calendar(evs, key, conflicts) {
           ${lanes(dayEv).map(({ e, lane, n }) => {
             const w = 100 / n;
             if (e.isAppt) return `<button class="ev appt ${e.clash ? 'clash' : ''}" data-act="ap-open" data-id="${e.apptId}" style="top:${y(e.start)};height:calc(${y(e.end)} - ${y(e.start)} - 2px);left:calc(${lane * w}% + 2px);width:calc(${w}% - 4px)" title="Persönlicher Termin – antippen zum Prüfen">
-              <b>${esc(e.a.title)}</b><span class="t">${C.fmt(e.start)}–${C.fmt(e.end)}</span><span>Persönlich · ${esc(e.a.category)}</span>${e.clash ? '<span class="tag">⚠ Konflikt</span>' : ''}${e.a.decision ? `<span>${esc(DEC[e.a.decision])}</span>` : ''}</button>`;
+              <b>${esc(e.a.title)}</b><span class="t">${C.fmt(e.start)}–${C.fmt(e.end)}</span><span>Persönlich · ${esc(e.a.category)}</span>${e.clash ? '<span class="tag">✗ nicht machbar</span>' : e.tight ? '<span class="tag">⚠ knapp</span>' : ''}${e.a.decision ? `<span>${esc(DEC[e.a.decision])}</span>` : ''}</button>`;
             return `<div class="ev ${(e.ids || [e.id]).some(i => clashIds.has(i)) ? 'clash' : ''}" style="--h:${hueFor(e.courseId)};top:${y(e.start)};height:calc(${y(e.end)} - ${y(e.start)} - 2px);left:calc(${lane * w}% + 2px);width:calc(${w}% - 4px)" title="${esc(`${e.label} · ${e.course.type} · ${C.fmt(e.start)}–${C.fmt(e.end)} · ${e.room} · ${e.instructor} · KW ${C.compressKeys(e.keys)}`)}">
               <b>${esc(e.label)}</b><span class="t">${C.fmt(e.start)}–${C.fmt(e.end)}</span><span>${esc(e.course.name !== e.course.code ? e.course.name : '')}</span><span>${esc(C.typeLabel(e.course))}</span><span>${esc(e.room)}</span><span>${esc(e.instructor)}</span>${key ? '' : `<span class="kw">KW ${esc(C.compressKeys(e.keys))}</span>`}</div>`;
           }).join('')}
