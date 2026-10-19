@@ -1,5 +1,5 @@
-/* Service Worker: App offline verfügbar, Updates im Hintergrund. Version: 14beaa2563 */
-const CACHE = 'spo-14beaa2563';
+/* Service Worker: App offline verfügbar, Updates im Hintergrund. Version: e8ab934890 */
+const CACHE = 'spo-e8ab934890';
 const SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-maskable-512.png', 'icons/apple-touch-icon.png', 'icons/favicon-32.png'];
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL.map((u) => new Request(u, { cache: 'reload' })))));

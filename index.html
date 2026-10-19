@@ -10,7 +10,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-<script>window.SPO_VERSION = {"name": "1.5", "build": "14beaa2563", "date": "20.10.2026 01:06"};</script>
+<script>window.SPO_VERSION = {"name": "1.6", "build": "e8ab934890", "date": "20.10.2026 01:17"};</script>
 <script src="config.js"></script>
 <title>Stundenplan-Optimierer</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -268,6 +268,35 @@ dl.kv dd { margin: 0; font: 500 .88rem var(--f-mono); text-align: right; white-s
 .fwgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
 .fwday { border: 1px solid var(--line-soft); border-radius: 9px; padding: 10px; display: grid; gap: 4px; align-content: start; }
 input[type="date"] { font: 500 .95rem var(--f-body); color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 7px; padding: 7px 9px; min-height: 38px; max-width: 100%; }
+/* Kalender: Tag / Monat / Liste */
+.tl.travel { background: transparent; color: var(--muted); border-left: 3px dotted var(--line); border-radius: 0; padding-left: 10px; }
+.tl.pers { display: block; padding: 0; background: transparent; }
+.cchip { all: unset; box-sizing: border-box; display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; width: 100%; cursor: pointer; padding: 6px 9px; border-radius: 7px; border: 1.5px dashed var(--line); background: var(--signal-soft); color: var(--ink); font-size: .85rem; }
+.cchip:focus-visible { outline: 2px solid var(--focus); }
+.cchip .cst { font-size: .76rem; font-weight: 600; color: var(--muted); }
+.cchip.ok .cst { color: var(--ok); }
+.cchip.warn { border-color: var(--warn); background: var(--warn-bg); } .cchip.warn .cst { color: var(--warn); }
+.cchip.bad { border: 2px solid var(--bad); background: var(--bad-bg); } .cchip.bad .cst { color: var(--bad); }
+.cchip.done { opacity: .6; background: var(--surface-2); }
+.cchip .creason { flex-basis: 100%; color: var(--ink); }
+.lday { display: grid; gap: 5px; padding-top: 8px; border-top: 1px solid var(--line-soft); }
+.lday .lhead { justify-self: start; padding: 0; min-height: 0; }
+.bad-t { color: var(--bad); }
+.mcal { display: grid; gap: 4px; }
+.mhead, .mgrid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+.mhead span { font: 600 .74rem var(--f-body); color: var(--muted); text-align: center; }
+.mday { all: unset; box-sizing: border-box; cursor: pointer; min-height: 84px; padding: 4px 5px; border: 1px solid var(--line-soft); border-radius: 7px; background: var(--surface); display: flex; flex-direction: column; gap: 2px; overflow: hidden; min-width: 0; }
+.mday:focus-visible { outline: 2px solid var(--focus); }
+.mday.out { opacity: .45; }
+.mday.today .mnum { background: var(--signal); color: var(--signal-ink); border-radius: 99px; padding: 0 6px; }
+.mday.bad { border: 2px solid var(--bad); } .mday.warn { border: 2px solid var(--warn); }
+.mnum { font: 700 .82rem var(--f-body); align-self: flex-start; }
+.muni { font-size: .7rem; color: var(--muted); }
+.mp { font-size: .72rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-left: 3px solid var(--signal); padding-left: 3px; }
+.mp.bad { border-color: var(--bad); color: var(--bad); } .mp.warn { border-color: var(--warn); } .mp.done { opacity: .6; } .mp.more { border: 0; color: var(--muted); }
+.mdot { display: none; width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+.mdot.bad { background: var(--bad); } .mdot.warn { background: var(--warn); }
+@media (max-width: 560px) { .mday { min-height: 54px; align-items: center; } .mp { display: none; } .muni { font-size: .62rem; } .mdot { display: block; } }
 </style>
 
 </head><body>
@@ -2823,6 +2852,105 @@ function personalCalendarItems(lineId, evs) {
   return out;
 }
 
+/* =================== KALENDER: Hochschule + persönliche Termine (Tag / Woche / Monat / Liste) =================== */
+const MON = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember'];
+function calState(ref) {
+  if (!ui.cal) {
+    const keys = [...new Set(ref.evs.flatMap(e => e.keys))].sort((a, b) => a - b);
+    const today = A.parseYmd(todayYmd()), nowKey = A.isoKey(today);
+    const date = !keys.length || keys.includes(nowKey) || nowKey > keys[keys.length - 1] ? today : C.dateOf(keys.find(k => k >= nowKey) || keys[0], 0);
+    ui.cal = { view: 'woche', date: A.ymd(date) };
+  }
+  return ui.cal;
+}
+/** alles an einem Datum: Veranstaltungen dieser KW + persönliche Termine mit Machbarkeit */
+function dayData(ref, d) {
+  const key = A.isoKey(d), wd = A.weekdayOf(d), date = A.ymd(d);
+  const pers = apptsAll().flatMap(a => A.occurrences(a, ref.sem).filter(o => o.date === date).map(o => {
+    const f = a.done || a.decision === 'skip' ? null : A.feasibility(ref.evs, a, o, activeAppts(), ref.sem);
+    return { a, start: o.start, end: o.end, status: a.done ? 'done' : a.decision === 'skip' ? 'skip' : f.status, reason: f ? f.reason : '' };
+  }));
+  const uni = C.mergeSlots(ref.evs).filter(e => e.weekday === wd && e.keys.includes(key)).map(e => ({
+    e, start: e.start, end: e.end, name: A.evName(e), group: e.label, room: e.room,
+    clash: pers.some(p => p.status === 'bad' && p.start < e.end && e.start < p.end) }));
+  return { d, date, key, wd, uni: uni.sort((x, y) => x.start - y.start), pers: pers.sort((x, y) => x.start - y.start) };
+}
+const PST = { ok: 'ok', tight: 'warn', bad: 'bad', unknown: '', done: 'done', skip: 'done' };
+const PLABEL = { ok: '✓', tight: '⚠ knapp', bad: '✗ nicht machbar', unknown: '? nicht prüfbar', done: '✓ erledigt', skip: 'nicht wahrgenommen' };
+
+function viewCalendar() {
+  const ref = refInfo();
+  const head = `<div class="lead"><h1>Kalender</h1><p class="muted">Hochschule und deine Termine zusammen. Rot = nicht machbar, gelb = knapp.</p></div>`;
+  if (!ref) return head + `<div class="alert info"><b>Noch kein Stundenplan.</b><span>Öffne unter „Pläne“ einen Plan oder speichere einen.</span><div><button class="btn primary" data-act="tab" data-id="plaene">Zu den Plänen</button></div></div>`;
+  const cs = calState(ref), d = A.parseYmd(cs.date);
+  const title = cs.view === 'tag' ? A.fmtDate(d) : cs.view === 'woche' ? `KW ${A.isoKey(d) % 100} · ${A.fmtDate(A.addDays(d, -A.weekdayOf(d)), false)} – ${A.fmtDate(A.addDays(d, 6 - A.weekdayOf(d)), false)}`
+    : cs.view === 'monat' ? `${MON[d.getUTCMonth()]} ${d.getUTCFullYear()}` : `ab ${A.fmtDate(d)} · 14 Tage`;
+  const body = cs.view === 'tag' ? calDay(ref, d) : cs.view === 'woche' ? calendar(ref.evs, A.isoKey(d), []) : cs.view === 'monat' ? calMonth(ref, d) : calList(ref, d);
+  return head + `<section class="panel" id="calview" style="gap:10px">
+    <div class="row between">
+      <span class="seg" role="group" aria-label="Ansicht">${[['tag', 'Tag'], ['woche', 'Woche'], ['monat', 'Monat'], ['liste', 'Liste']].map(([k, l]) => `<button data-act="cal-view" data-id="${k}" aria-pressed="${cs.view === k}">${l}</button>`).join('')}</span>
+      <div class="row" style="gap:6px"><button class="btn sm" data-act="cal-nav" data-v="-1" aria-label="zurück">←</button><button class="btn sm" data-act="cal-today">Heute</button><button class="btn sm" data-act="cal-nav" data-v="1" aria-label="weiter">→</button></div>
+    </div>
+    <div class="row between"><b id="caltitle">${esc(title)}</b><span class="small muted">Geprüft gegen: ${esc(ref.label)}</span></div>
+    ${body}
+  </section>`;
+}
+function persChip(p, withReason) {
+  return `<button class="cchip ${PST[p.status]}" data-act="ap-open" data-id="${p.a.id}" title="${esc(p.reason || '')}"><span class="mono">${t2(p.start, p.end)}</span> <b>${esc(p.a.title)}</b> <span class="cst">${PLABEL[p.status]}</span>${withReason && p.reason && p.status !== 'ok' ? `<span class="small creason">${esc(p.reason)}</span>` : ''}</button>`;
+}
+function calDay(ref, d) {
+  const dd = dayData(ref, d);
+  const rows = [];
+  for (const u of dd.uni) rows.push({ t: u.start, html: `<div class="tl uni${u.clash ? ' clash' : ''}"><span class="mono">${t2(u.start, u.end)}</span><span><b>${esc(u.name)}</b> <span class="small muted">${esc(u.group)}${u.room ? ' · ' + esc(u.room) : ''}</span></span></div>` });
+  for (const p of dd.pers) {
+    const a = p.a, live = p.status !== 'done' && p.status !== 'skip';
+    const bb = a.buffer ? +a.bufBefore || 0 : 0, ba = a.buffer ? +a.bufAfter || 0 : 0;
+    if (live && (a.travelTo || bb)) { const s = p.start - bb - (a.travelTo || 0); rows.push({ t: s, html: `<div class="tl travel"><span class="mono">${t2(s, p.start)}</span><span class="small">${a.travelTo ? `Anfahrt ${a.travelTo} Min.` : ''}${a.travelTo && bb ? ' + ' : ''}${bb ? `${bb} Min. Puffer` : ''}</span></div>` }); }
+    rows.push({ t: p.start + 0.5, html: `<div class="tl pers">${persChip(p, true)}</div>` });
+    if (live && (a.travelBack || ba)) { const e = p.end + ba + (a.travelBack || 0); rows.push({ t: p.end + 0.6, html: `<div class="tl travel"><span class="mono">${t2(p.end, e)}</span><span class="small">${ba ? `${ba} Min. Puffer` : ''}${a.travelBack && ba ? ' + ' : ''}${a.travelBack ? `Rückfahrt ${a.travelBack} Min.` : ''}</span></div>` }); }
+  }
+  rows.sort((x, y) => x.t - y.t);
+  return rows.length ? `<div class="tlist">${rows.map(r => r.html).join('')}</div>` : '<p class="muted">Keine Termine an diesem Tag.</p>';
+}
+function calMonth(ref, d) {
+  const first = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)), start = A.addDays(first, -A.weekdayOf(first));
+  const today = todayYmd(), cells = [];
+  for (let i = 0; i < 42; i++) {
+    const day = A.addDays(start, i); if (i >= 35 && day.getUTCMonth() !== d.getUTCMonth()) break;
+    const dd = dayData(ref, day), out = day.getUTCMonth() !== d.getUTCMonth();
+    const worst = dd.pers.some(p => p.status === 'bad') ? 'bad' : dd.pers.some(p => p.status === 'tight') ? 'warn' : '';
+    cells.push(`<button class="mday${out ? ' out' : ''}${dd.date === today ? ' today' : ''}${worst ? ' ' + worst : ''}" data-act="cal-day" data-date="${dd.date}" aria-label="${esc(A.fmtDate(day))}">
+      <span class="mnum">${day.getUTCDate()}</span>
+      ${dd.uni.length ? `<span class="muni">${dd.uni.length} V</span>` : ''}
+      ${dd.pers.slice(0, 2).map(p => `<span class="mp ${PST[p.status]}">${esc(p.a.title)}</span>`).join('')}${dd.pers.length > 2 ? `<span class="mp more">+${dd.pers.length - 2}</span>` : ''}
+      ${dd.pers.length ? `<span class="mdot ${worst || 'ok'}"></span>` : ''}</button>`);
+  }
+  return `<div class="mcal"><div class="mhead">${C.DS.slice(0, 7).map(x => `<span>${x}</span>`).join('')}</div><div class="mgrid">${cells.join('')}</div></div>
+    <p class="small muted">V = Veranstaltungen der Hochschule. Tag antippen für die Tagesansicht.</p>`;
+}
+function calList(ref, d) {
+  const days = [];
+  for (let i = 0; i < 14; i++) {
+    const dd = dayData(ref, A.addDays(d, i)); if (!dd.uni.length && !dd.pers.length) continue;
+    const uniLine = dd.uni.length ? `<div class="small"><span class="pill">Hochschule</span> <span class="mono">${t2(dd.uni[0].start, Math.max(...dd.uni.map(u => u.end)))}</span> · ${dd.uni.length} ${dd.uni.length === 1 ? 'Veranstaltung' : 'Veranstaltungen'}${dd.uni.some(u => u.clash) ? ' · <b class="bad-t">Überschneidung</b>' : ''}</div>` : '';
+    days.push(`<div class="lday"><button class="btn ghost sm lhead" data-act="cal-day" data-date="${dd.date}"><b>${esc(A.fmtDate(dd.d))}</b></button>${uniLine}${dd.pers.map(p => persChip(p, true)).join('')}</div>`);
+  }
+  return days.length ? `<div class="stack" style="gap:10px">${days.join('')}</div>` : '<p class="muted">In den nächsten 14 Tagen nichts eingetragen.</p>';
+}
+function onCalClick(act, el) {
+  const cs = ui.cal; if (!cs && act !== 'cal-view') return false;
+  switch (act) {
+    case 'cal-view': ui.cal.view = el.dataset.id; render(); return true;
+    case 'cal-today': cs.date = todayYmd(); render(); return true;
+    case 'cal-day': cs.date = el.dataset.date; cs.view = 'tag'; render(); return true;
+    case 'cal-nav': {
+      const v = +el.dataset.v, d = A.parseYmd(cs.date);
+      cs.date = A.ymd(cs.view === 'tag' ? A.addDays(d, v) : cs.view === 'woche' ? A.addDays(d, 7 * v) : cs.view === 'liste' ? A.addDays(d, 14 * v) : new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + v, 1)));
+      render(); return true; }
+  }
+  return false;
+}
+
 /* ===== Konto, Abgleich zwischen Geräten, Sicherung/Übertragung der Daten =====
    Nur aktiv, wenn die App außerhalb von Claude läuft (eigene App/Webseite) und ein Online-Speicher eingerichtet ist.
    In Claude bleibt alles wie bisher (Speicherung im Claude-Konto); dort gibt es nur „Daten sichern/übertragen“. */
@@ -2858,7 +2986,7 @@ const Acct = {
   clearUiData() {
     if (ui.lastDownload) { try { URL.revokeObjectURL(ui.lastDownload.url); } catch (e) { /* */ } }
     for (const k of ['results', 'plan', 'importPreview', 'alt', 'lastChange', 'lastDownload', 'exportError', 'editEvent', 'confirmDelete', 'confirmOff', 'wiConfirm',
-      'reviewSem', 'pdfReport', 'importNotes', 'parseError', 'parsing', 'apptForm', 'apptOpen', 'apptRef', 'apptDel', 'fw', 'check', 'anonConfirm', 'wipeConfirm', 'wipeMsg', 'apptMove']) ui[k] = null;
+      'reviewSem', 'pdfReport', 'importNotes', 'parseError', 'parsing', 'apptForm', 'apptOpen', 'apptRef', 'apptDel', 'fw', 'check', 'anonConfirm', 'wipeConfirm', 'wipeMsg', 'apptMove', 'cal']) ui[k] = null;
     ui.calOff = false; ui.calPreview = false; ui.semForm = false; ui.touched = false; ui.planKw = ''; ui.dismissed = new Set();
     this.conflicts = [];
   },
@@ -3367,6 +3495,7 @@ function renderTabs() {
   ];
   if (ui.plan) tabs.push(['plan', 'Plan ansehen', '']);
   tabs.push(['termine', 'Termine', apptTabExtra()]);
+  tabs.push(['kalender', 'Kalender', '']);
   tabs.push(['meine', 'Meine Pläne', ui.saved.length ? `<span class="count">${ui.saved.length}</span>` : '']);
   if (typeof Acct !== 'undefined') tabs.push(['konto', Store.mode === 'db' || insideClaude() ? 'Daten' : 'Konto', Acct.active() ? '' : (Cloud.configured() && !insideClaude() && Store.mode !== 'db' ? '<span class="count warn">!</span>' : '')]);
   $('#tabs').innerHTML = tabs.map(([id, label, extra]) => `<button class="tab" data-act="tab" data-id="${id}" ${ui.tab === id ? 'aria-current="page"' : ''}>${label}${extra}</button>`).join('');
@@ -3374,7 +3503,7 @@ function renderTabs() {
 function render() {
   try {
     renderTabs();
-    const v = { semester: viewSemester, faecher: viewCourses, wuensche: viewPrefs, plaene: viewResults, plan: viewPlan, termine: viewAppts, meine: viewSaved, konto: viewAccount }[ui.tab] || viewSemester;
+    const v = { semester: viewSemester, faecher: viewCourses, wuensche: viewPrefs, plaene: viewResults, plan: viewPlan, termine: viewAppts, kalender: viewCalendar, meine: viewSaved, konto: viewAccount }[ui.tab] || viewSemester;
     $('#view').innerHTML = fatalHtml() + v();
     afterRender();
   } catch (e) {
@@ -4151,6 +4280,7 @@ async function onClick(ev) {
   const act = a.dataset.act, id = a.dataset.id;
   if (a.tagName === 'A') ev.preventDefault();
   if (/^(ap|fw)-/.test(act) && onApptClick(act, a)) return;
+  if (/^cal-(view|nav|today|day)$/.test(act) && onCalClick(act, a)) return;
   if (/^(acct|cfg)-/.test(act)) { await onAcctClick(act, id); return; }
   if (a.tagName === 'SELECT' || (a.tagName === 'INPUT' && a.type !== 'checkbox')) return;
   if (a.tagName === 'INPUT' && a.type === 'checkbox') return; // über change
