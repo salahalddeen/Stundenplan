@@ -10,7 +10,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-<script>window.SPO_VERSION = {"name": "1.1", "build": "73a00bcbf1", "date": "03.10.2026 22:51"};</script>
+<script>window.SPO_VERSION = {"name": "1.1.1", "build": "3e4b8dc5cc", "date": "04.10.2026 22:27"};</script>
 <script src="config.js"></script>
 <title>Stundenplan-Optimierer</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -285,6 +285,32 @@ input[type="date"] { font: 500 .95rem var(--f-body); color: var(--ink); backgrou
 </div>
 <div id="toast" class="toast" hidden></div>
 
+<script>
+/* Safari-Kompatibilität: Safari kann über einen ReadableStream nicht mit „for await“ laufen.
+   pdf.js braucht das beim Lesen des Textes einer PDF-Seite → hier nachrüsten (nur wenn es fehlt). */
+(function () {
+  if (typeof ReadableStream === 'undefined') return;
+  const P = ReadableStream.prototype;
+  if (typeof P.values !== 'function') {
+    P.values = function ({ preventCancel = false } = {}) {
+      const reader = this.getReader();
+      return {
+        async next() { try { const r = await reader.read(); if (r.done) reader.releaseLock(); return r; } catch (e) { reader.releaseLock(); throw e; } },
+        async return(value) { if (!preventCancel) { const c = reader.cancel(value); reader.releaseLock(); await c; } else reader.releaseLock(); return { done: true, value }; },
+        [Symbol.asyncIterator]() { return this; },
+      };
+    };
+  }
+  if (typeof P[Symbol.asyncIterator] !== 'function') P[Symbol.asyncIterator] = P.values;
+})();
+/* ältere Safari-Versionen (vor 17.4): ArrayBuffer.transfer fehlt – Kopie statt Übergabe genügt hier */
+(function () {
+  const A = ArrayBuffer.prototype;
+  const copy = function (len) { const n = len === undefined ? this.byteLength : len; const out = new ArrayBuffer(n); new Uint8Array(out).set(new Uint8Array(this, 0, Math.min(n, this.byteLength))); return out; };
+  if (typeof A.transferToFixedLength !== 'function') A.transferToFixedLength = copy;
+  if (typeof A.transfer !== 'function') A.transfer = copy;
+})();
+</script>
 <script>!function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"function"==typeof define&&define.amd?define(["exports"],e):e((t=t||self).PDFLib={})}(this,(function(t){"use strict";
 /*! *****************************************************************************
     Copyright (c) Microsoft Corporation. All rights reserved.
