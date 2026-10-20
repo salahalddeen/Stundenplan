@@ -10,7 +10,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-<script>window.SPO_VERSION = {"name": "1.6", "build": "e8ab934890", "date": "20.10.2026 01:17"};</script>
+<script>window.SPO_VERSION = {"name": "1.7", "build": "39e3fc4d61", "date": "20.10.2026 10:27"};</script>
 <script src="config.js"></script>
 <title>Stundenplan-Optimierer</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -613,6 +613,300 @@ const ListParser = (() => {
 })();
 if (typeof module !== 'undefined') module.exports = ListParser;
 
+/* ===== Wochenablaufplan-Leser =====
+   Für Pläne mit einem eigenen Raster je Woche („Woche 3 alle“, „Woche 7 Gr. 1,3,5,7,9,11“), Datum über jedem Tag,
+   Uhrzeiten links und Zellen aus Excel (Rahmenlinien zeigen verbundene Zellen).
+   Grundsatz: nur übernehmen, was im PDF steht. Gruppen werden NICHT geraten: Einträge tragen die Gruppennummern,
+   die dastehen; gefiltert wird erst, wenn du deine Kursgruppe angibst (toEvents).
+   Eingabe je Seite: { items: [{str, x, top, h, w}], lines: [{x0, x1, y0, y1}] (dünne Rahmenlinien), W, H }. */
+const WeekGridParser = (() => {
+  const DAYS = ['Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag', 'Sonntag'];
+  const DS = { Mo: 0, Di: 1, Mi: 2, Do: 3, Fr: 4, Sa: 5, So: 6 };
+  const DATE_RE = /^(\d{2})\.(\d{2})\.(\d{4})/;
+  const HDR_RE = /^Woche\s+(\d{1,2})\b/;
+  const TIME_RANGE = /(\d{1,2})[.:](\d{2})\s*(?:Uhr)?\s*[-–]\s*(\d{1,2})[.:](\d{2})/;
+  const median = (a) => { const s = a.slice().sort((x, y) => x - y); return s.length ? s[Math.floor(s.length / 2)] : 0; };
+  const ymd = (d) => `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  const wdOf = (d) => (d.getUTCDay() + 6) % 7;
+  function isoKey(d) {
+    const t = new Date(d.getTime()); t.setUTCDate(t.getUTCDate() + 3 - wdOf(t));
+    const y = t.getUTCFullYear(), j4 = new Date(Date.UTC(y, 0, 4));
+    return y * 100 + 1 + Math.round((t - j4) / 864e5 / 7 - (3 - wdOf(j4)) / 7);
+  }
+  const toMin = (h, m) => +h * 60 + +m;
+  const nums = (s) => (String(s).match(/\d{1,2}/g) || []).map(Number);
+
+  /** Erkennen: mindestens eine Wochenüberschrift mit einer Datumszeile und Tagesnamen darunter */
+  function detect(pages) {
+    let hits = 0;
+    for (const p of pages || []) {
+      const hs = p.items.filter(i => HDR_RE.test(i.str));
+      for (const h of hs) {
+        const below = p.items.filter(i => i.top > h.top && i.top < h.top + h.h * 6);
+        if (below.filter(i => DATE_RE.test(i.str)).length >= 3 && below.filter(i => DAYS.includes(i.str)).length >= 3) hits++;
+      }
+    }
+    return hits >= 1;
+  }
+
+  /** Zeilen aus Textstücken: gleiche Höhe → eine Zeile */
+  function textLines(items, tol) {
+    const sorted = items.slice().sort((a, b) => a.top - b.top || a.x - b.x);
+    const lines = [];
+    for (const it of sorted) {
+      const l = lines.find(L => Math.abs(L.top - it.top) <= tol);
+      if (l) l.items.push(it); else lines.push({ top: it.top, items: [it] });
+    }
+    return lines.sort((a, b) => a.top - b.top).map(l => l.items.sort((a, b) => a.x - b.x).map(i => i.str).join(' ').replace(/\s+/g, ' ').trim());
+  }
+
+  function parse(pages) {
+    const weeks = [], entries = [], warnings = [], notes = [], meta = {};
+    const dates = [], holidays = new Set();
+    pages.forEach((p, pi) => {
+      const H = median(p.items.map(i => i.h)) || 9, tol = H * 0.45;
+      const vlines = p.lines.filter(l => (l.x1 - l.x0) < H * 0.4 && (l.y1 - l.y0) > H * 0.4);
+      const hlines = p.lines.filter(l => (l.y1 - l.y0) < H * 0.4 && (l.x1 - l.x0) > H * 0.4);
+      const used = new Set();
+      // Stand-Datum (rechts oben, allein stehendes Datum über der ersten Woche)
+      const heads = p.items.filter(i => HDR_RE.test(i.str)).sort((a, b) => a.top - b.top || a.x - b.x);
+      const grids = [];
+      for (const h of heads) {
+        // Überschrift: „Woche 7“ + „Gr. 1,3,5,7,9,11“ (oft getrennte Textstücke)
+        const same = p.items.filter(i => i !== h && Math.abs(i.top - h.top) <= tol && i.x > h.x && i.x < h.x + H * 25 && !HDR_RE.test(i.str));
+        const htext = [h.str].concat(same.sort((a, b) => a.x - b.x).map(i => i.str)).join(' ');
+        const weekNo = +HDR_RE.exec(h.str)[1];
+        // Datumszeile darunter: die Gruppe von Datumsangaben, deren Spannweite die Überschrift enthält
+        const row = p.items.filter(i => DATE_RE.test(i.str) && i.top > h.top && i.top < h.top + H * 4).sort((a, b) => a.x - b.x);
+        if (!row.length) continue;
+        const clusters = []; let cur = [row[0]];
+        const gaps = row.slice(1).map((r, k) => r.x - row[k].x); const g0 = median(gaps) || H * 10;
+        for (let k = 1; k < row.length; k++) { if (row[k].x - row[k - 1].x > g0 * 1.8) { clusters.push(cur); cur = []; } cur.push(row[k]); }
+        clusters.push(cur);
+        const hc = h.x + (h.w || 0) / 2;
+        const ds = clusters.find(c => c[0].x - g0 <= hc && c[c.length - 1].x + g0 * 1.5 >= hc) || clusters[0];
+        const dayRow = p.items.filter(i => DAYS.includes(i.str) && i.top > ds[0].top && i.top < ds[0].top + H * 3 && i.x >= ds[0].x - H * 2 && i.x <= ds[ds.length - 1].x + g0);
+        const dayTop = dayRow.length ? Math.min(...dayRow.map(i => i.top)) : ds[0].top + H * 1.5;
+        // Spalten: linke Rahmenlinie je Datum
+        const vAt = (x, y) => vlines.filter(l => l.y0 <= y && l.y1 >= y && Math.abs((l.x0 + l.x1) / 2 - x) < H * 1.2);
+        const cols = ds.map((d, k) => {
+          const m = DATE_RE.exec(d.str); const date = new Date(Date.UTC(+m[3], +m[2] - 1, +m[1]));
+          const left = vlines.filter(l => l.y0 <= dayTop + H && l.y1 >= dayTop && (l.x0 + l.x1) / 2 <= d.x + H * 0.3 && (l.x0 + l.x1) / 2 > d.x - H * 3).sort((a, b) => b.x0 - a.x0)[0];
+          const extra = p.items.filter(i => i !== d && Math.abs(i.top - d.top) <= tol && i.x > d.x && i.x < d.x + g0 * 0.9).map(i => i.str).join(' ');
+          return { date, x0: left ? (left.x0 + left.x1) / 2 : d.x - H * 0.3, label: (d.str + ' ' + extra).trim() };
+        });
+        cols.forEach((c, k) => { c.x1 = k + 1 < cols.length ? cols[k + 1].x0 : null; });
+        const last = cols[cols.length - 1];
+        const rightLine = vlines.filter(l => l.y0 <= dayTop + H && l.y1 >= dayTop && (l.x0 + l.x1) / 2 > last.x0 + H * 3).sort((a, b) => a.x0 - b.x0)[0];
+        last.x1 = rightLine ? (rightLine.x0 + rightLine.x1) / 2 : last.x0 + (cols.length > 1 ? cols[1].x0 - cols[0].x0 : g0);
+        cols.forEach(c => { c.holiday = /feiertag/i.test(c.label); c.wd = wdOf(c.date); });
+        const uhr = p.items.filter(i => /^Uhrzeit$/.test(i.str) && Math.abs(i.top - dayTop) < H && i.x < cols[0].x0 && i.x > cols[0].x0 - H * 8).sort((a, b) => b.x - a.x)[0];
+        const tx0 = uhr ? uhr.x - H * 0.5 : cols[0].x0 - H * 4;
+        grids.push({ h, htext, weekNo, cols, dayTop, tx0, top: h.top, x0: tx0, x1: last.x1, page: pi });
+        cols.forEach(c => dates.push(c.date));
+      }
+      // Höhe jedes Rasters: bis zur nächsten Überschrift darunter, die horizontal überlappt
+      for (const g of grids) {
+        const nxt = grids.filter(o => o !== g && o.top > g.top + H && o.x0 < g.x1 && o.x1 > g.x0).sort((a, b) => a.top - b.top)[0];
+        g.bottom = nxt ? nxt.top - H * 0.5 : p.H;
+      }
+      for (const g of grids) {
+        const cols = g.cols, c0 = cols[0].x0, tmid = (g.tx0 + c0) / 2;
+        // Zeilen: Rahmenlinien quer durch die Zeitspalte
+        const ys = hlines.filter(l => l.x0 <= tmid && l.x1 >= tmid && l.y0 > g.dayTop && l.y0 < g.bottom).map(l => (l.y0 + l.y1) / 2).sort((a, b) => a - b);
+        const bounds = []; ys.forEach(y => { if (!bounds.length || y - bounds[bounds.length - 1] > H * 0.5) bounds.push(y); });
+        const timeItems = p.items.filter(i => i.x >= g.tx0 - H && i.x < c0 - H * 0.2 && i.top > g.dayTop + H * 0.5 && i.top < g.bottom);
+        const rows = [];
+        for (let k = 0; k + 1 < bounds.length; k++) {
+          const y0 = bounds[k], y1 = bounds[k + 1];
+          const its = timeItems.filter(i => i.top + i.h / 2 > y0 && i.top + i.h / 2 < y1);
+          const m = TIME_RANGE.exec(textLines(its, tol).join(' '));
+          if (m) rows.push({ y0, y1, start: toMin(m[1], m[2]), end: toMin(m[3], m[4]) });
+        }
+        if (!rows.length) { warnings.push({ text: `Seite ${g.page + 1}, Woche ${g.weekNo}: keine Uhrzeiten-Zeilen erkannt – übersprungen.` }); continue; }
+        g.rows = rows;
+        // verbundene Zellen: fehlt die Rahmenlinie zwischen zwei Zellen, gehören sie zusammen
+        const hasV = (x, y) => vlines.some(l => l.y0 <= y && l.y1 >= y && Math.abs((l.x0 + l.x1) / 2 - x) < H * 0.4);
+        const hasH = (y, x) => hlines.some(l => l.x0 <= x && l.x1 >= x && Math.abs((l.y0 + l.y1) / 2 - y) < H * 0.4);
+        const R = rows.length, Cn = cols.length, parent = [...Array(R * Cn).keys()];
+        const find = (a) => parent[a] === a ? a : (parent[a] = find(parent[a]));
+        const join = (a, b) => { parent[find(a)] = find(b); };
+        for (let r = 0; r < R; r++) for (let c = 0; c < Cn; c++) {
+          const ym = (rows[r].y0 + rows[r].y1) / 2, xm = (cols[c].x0 + cols[c].x1) / 2;
+          if (c + 1 < Cn && !hasV(cols[c].x1, ym)) join(r * Cn + c, r * Cn + c + 1);
+          if (r + 1 < R && !hasH(rows[r].y1, xm)) join(r * Cn + c, (r + 1) * Cn + c);
+        }
+        const regions = new Map();
+        for (let r = 0; r < R; r++) for (let c = 0; c < Cn; c++) { const k = find(r * Cn + c); if (!regions.has(k)) regions.set(k, { rows: new Set(), cols: new Set() }); regions.get(k).rows.add(r); regions.get(k).cols.add(c); }
+        const gridItems = p.items.filter(i => i.top + i.h / 2 > rows[0].y0 && i.top + i.h / 2 < rows[R - 1].y1 && i.x >= c0 - H * 0.2 && i.x < cols[Cn - 1].x1);
+        gridItems.forEach(i => used.add(i));
+        timeItems.forEach(i => used.add(i));
+        // Überschrift, Datum, Tage gehören zum Raster
+        p.items.filter(i => i.top >= g.top - tol && i.top <= g.dayTop + tol && i.x >= g.tx0 - H && i.x < cols[Cn - 1].x1).forEach(i => used.add(i));
+        const half = /Gr\.?\s*([\d,\s;]+)/.exec(g.htext);
+        g.cohort = half ? nums(half[1]).filter(n => n >= 1 && n <= 30) : null;
+        g.label = g.htext.replace(/\s+/g, ' ').trim();
+        weeks.push({ weekNo: g.weekNo, label: g.label, cohort: g.cohort, dates: cols.map(c => ymd(c.date)), rows: rows.map(r => [r.start, r.end]) });
+        const regs = [...regions.values()].map(rg => {
+          const rs = [...rg.rows].sort((a, b) => a - b), cs = [...rg.cols].sort((a, b) => a - b);
+          const box = { x0: cols[cs[0]].x0, x1: cols[cs[cs.length - 1]].x1, y0: rows[rs[0]].y0, y1: rows[rs[rs.length - 1]].y1 };
+          const its = gridItems.filter(i => { const cx = i.x + Math.min(i.w || 0, H * 2) / 2, cy = i.top + i.h / 2; return cx >= box.x0 && cx < box.x1 && cy > box.y0 && cy < box.y1; });
+          return { rs, cs, box, lines: textLines(its, tol), start: rows[rs[0]].start, end: rows[rs[rs.length - 1]].end };
+        }).filter(rg => rg.lines.length);
+        // Modul-Zuordnung dieser Woche („Gruppe 1: Herz  Gruppe 3: Lunge …“)
+        const assign = {};
+        for (const rg of regs) {
+          const t = rg.lines.join(' ');
+          if (/^(\s*Gruppe\s*\d{1,2}\s*:\s*[A-Za-zÄÖÜäöüß]+\s*)+$/.test(t)) { rg.assign = true; for (const m of t.matchAll(/Gruppe\s*(\d{1,2})\s*:\s*([A-Za-zÄÖÜäöüß]+)/g)) assign[+m[1]] = m[2]; }
+        }
+        g.assign = assign;
+        for (const rg of regs) {
+          for (const c of rg.cs) {
+            const col = cols[c];
+            const base = { weekNo: g.weekNo, weekLabel: g.label, gridCohort: g.cohort, date: ymd(col.date), weekday: col.wd, page: g.page + 1 };
+            if (col.holiday) { const k = ymd(col.date); if (!holidays.has(k)) { holidays.add(k); warnings.push({ text: `${col.label} (Woche ${g.weekNo}): im PDF als Feiertag markiert – an diesem Tag nichts übernommen.` }); } continue; }
+            if (rg.assign) {
+              // die Zuordnungszelle selbst ist ein Modul-Termin der genannten Gruppen
+              entries.push({ ...base, title: 'Module', kind: 'module', cohorts: Object.keys(assign).map(Number), start: rg.start, end: rg.end, assign, src: rg.lines.join(' ') });
+              continue;
+            }
+            for (const e of cellEntries(rg.lines, rg.start, rg.end, cols, col)) {
+              if (e.kind === 'module') { e.cohorts = Object.keys(assign).length ? Object.keys(assign).map(Number) : null; e.assign = assign; }
+              entries.push({ ...base, ...e, weekday: e.weekday ?? col.wd, date: e.date || base.date });
+            }
+          }
+        }
+      }
+      // Hinweise außerhalb der Raster (z. B. rote Sonderregel unter dem Plan)
+      const rest = p.items.filter(i => !used.has(i));
+      for (const l of textLines(rest, tol)) {
+        if (DATE_RE.test(l) && l.length <= 12) { if (!meta.standDate) { const m = DATE_RE.exec(l); meta.standDate = `${m[3]}-${m[2]}-${m[1]}`; } continue; }
+        if (/^Wochenablaufplan$|^Woche\s+\d/.test(l)) continue;
+        if (/Gruppe|Woche|Kurs|\d{2}\.\d{2}\.\d{4}/.test(l)) notes.push(l);
+      }
+    });
+    // Semester aus den Daten
+    if (dates.length) {
+      const d0 = dates.slice().sort((a, b) => a - b)[0], m = d0.getUTCMonth() + 1;
+      meta.term = m >= 8 || m <= 2 ? 'WS' : 'SS'; meta.startYear = m <= 2 ? d0.getUTCFullYear() - 1 : d0.getUTCFullYear();
+    }
+    const cohortMax = Math.max(0, ...entries.flatMap(e => e.cohorts || []), ...weeks.flatMap(w => w.cohort || []));
+    meta.cohortMax = cohortMax;
+    return { entries, weeks, warnings, notes, meta };
+  }
+
+  /* ---------- Inhalt einer Zelle → Einträge ---------- */
+  const STARTERS = /^(Kurs|Vo\.|Vorlesungen|Vorlesungsblock:?|Vorlesung|Module|Einf\.|SkillsLab|Skillslab|Gruppe|Gruppen|GTE|Seminar|Praktikum)$/;
+  function cellEntries(lines, rowStart, rowEnd, cols, col) {
+    const text = lines.join(' ').replace(/\s+/g, ' ').trim();
+    const out = [];
+    // Skillslab Digitalisierungskurs: „Gruppe 7: Do 10:00“ – Tag und Beginn stehen da, das Ende nicht
+    if (/Skills?lab\s+Digitalisierungskurs/i.test(text)) {
+      for (const m of text.matchAll(/Gruppe\s*(\d{1,2})\s*:\s*(Mo|Di|Mi|Do|Fr|Sa)\.?\s*(\d{1,2})[.:](\d{2})/g)) {
+        const wd = DS[m[2]], c = cols.find(x => x.wd === wd);
+        out.push({ title: 'Skillslab Digitalisierungskurs', kind: 'digi', cohorts: [+m[1]], weekday: wd, date: c ? ymd(c.date) : null, start: toMin(m[3], m[4]), end: null, noEnd: true, src: text, holiday: c ? c.holiday : false });
+      }
+      if (!out.length) out.push({ title: 'Skillslab Digitalisierungskurs', kind: 'unclear', cohorts: null, start: rowStart, end: rowEnd, src: text });
+      return out.filter(e => !e.holiday);
+    }
+    // SkillsLab: „Gruppe 1: 08.00-11.00 Uhr; Gruppe 2 12.00-15.00Uhr“ (eigene Einteilung 1/2, nicht die Kursgruppe)
+    if (/SkillsLab/i.test(text)) {
+      const note = [/\(?2x pro Student\)?/i.test(text) ? '2× pro Student' : '', /Beginn:\s*Woche\s*\d+/i.exec(text) ? /Beginn:\s*Woche\s*\d+/i.exec(text)[0] : '', /dringendem Bedarf/i.test(text) ? 'nur bei dringendem Bedarf' : ''].filter(Boolean).join(' · ');
+      for (const m of text.matchAll(/Gruppe\s*([12])\s*:?\s*(\d{1,2})[.:](\d{2})\s*-\s*(\d{1,2})[.:](\d{2})/g))
+        out.push({ title: 'SkillsLab', kind: 'skills', skillsGroup: +m[1], cohorts: null, start: toMin(m[2], m[3]), end: toMin(m[4], m[5]), note, src: text });
+      return out;
+    }
+    // nur Hinweise ohne Veranstaltung (z. B. „(2x pro Student) Beginn: Woche 3“)
+    if (/^\(?2x pro Student\)?\s*(Beginn:\s*Woche\s*\d+)?$/i.test(text)) return out;
+    // in Abschnitte teilen: jeder beginnt mit „Kurs“, „Vo.“, „Gruppen …“, „Module“ …
+    const words = text.split(' ');
+    const chunks = []; let cur = [];
+    words.forEach((w, k) => {
+      const prev = words[k - 1];
+      if (k > 0 && STARTERS.test(w) && !/^(Vo\.|Kurs|Gruppen?)$/.test(prev) && !(w === 'Kurs' && /\d{1,2}[.:]\d{2}$/.test(prev) && /^Gruppen?$/.test(cur[0]))) { chunks.push(cur.join(' ')); cur = []; }
+      cur.push(w);
+    });
+    if (cur.length) chunks.push(cur.join(' '));
+    let carry = null;
+    for (const ch of chunks) {
+      const e = chunkEntry(ch, rowStart, rowEnd);
+      if (!e.title) { carry = { cohorts: e.cohorts || (carry && carry.cohorts), start: e.timeSet ? e.start : carry && carry.start, end: e.timeSet ? e.end : carry && carry.end, src: ch }; continue; }
+      if (carry) { if (!e.cohorts && carry.cohorts) e.cohorts = carry.cohorts; if (!e.timeSet && carry.start != null) { e.start = carry.start; e.end = carry.end; e.timeSet = true; } e.src = carry.src + ' ' + e.src; carry = null; }
+      out.push(e);
+    }
+    return out;
+  }
+  function chunkEntry(ch, rowStart, rowEnd) {
+    let t = ch, start = rowStart, end = rowEnd, timeSet = false, cohorts = null, weeksOnly = null, note = '';
+    const tr = TIME_RANGE.exec(t);
+    if (tr) { start = toMin(tr[1], tr[2]); end = toMin(tr[3], tr[4]); timeSet = true; t = t.replace(tr[0], ' '); }
+    t = t.replace(/\(\s*\)/g, ' ');
+    const kt = /\(?\s*Kurstag\s*(\d+)\s*\)?/i.exec(t); if (kt) { note = `Kurstag ${kt[1]}`; t = t.replace(kt[0], ' '); }
+    const wo = /\bWo\.?\s*(\d{1,2})\s*[-–]\s*(\d{1,2})\b/.exec(t); if (wo) { weeksOnly = [+wo[1], +wo[2]]; t = t.replace(wo[0], ' '); }
+    t = t.replace(/\s+/g, ' ').trim();
+    // „Gruppen 2 und 4:“ / „Gruppe 7:“
+    const gp = /^Gruppen?\s+((?:\d{1,2}\s*(?:,|;|und|&)?\s*)+):?\s*/.exec(t);
+    if (gp) { cohorts = nums(gp[1]); t = t.slice(gp[0].length).trim(); }
+    let kind = 'other';
+    if (/^Vo\.|^Vorlesung/.test(t)) {
+      kind = 'lecture';
+      t = t.replace(/\s+\d{1,2}$/, ''); // „Vo. Epidemiologie 7“ = Vorlesung Nr. 7, keine Gruppe
+    } else if (/^(Kurs|GTE)\b/.test(t)) {
+      kind = 'course';
+      const m = /^(.*?[A-Za-zÄÖÜäöüß.)])[\s:.]+((?:\d{1,2}\s*[,;]?\s*)+)$/.exec(t);
+      if (m && nums(m[2]).every(n => n >= 1 && n <= 30)) { cohorts = nums(m[2]); t = m[1]; }
+    } else if (/^Module$/.test(t)) kind = 'module';
+    t = t.replace(/[\s:.,;-]+$/, '').replace(/^[\s:.,;-]+/, '').replace(/\s+/g, ' ');
+    if (!/[A-Za-zÄÖÜäöü]{2,}/.test(t)) return { title: '', cohorts, start, end, timeSet, src: ch };
+    return { title: t, kind, cohorts, start, end, timeSet, weeksOnly, note, src: ch };
+  }
+
+  /**
+   * Für eine Kursgruppe (und optional SkillsLab-Gruppe) die Termine bilden – im Format des Listen-Lesers.
+   * group: Nummer der Kursgruppe; skills: 1 | 2 | null (unbekannt → beide als Wahlmöglichkeit, Fach ausgeschaltet)
+   */
+  function toEvents(wp, group, skills) {
+    const warnings = [], byKey = new Map(), seenAssign = new Set();
+    const mine = (e) => {
+      if (e.kind === 'skills') return skills == null || e.skillsGroup === skills;
+      const coh = e.cohorts && e.cohorts.length ? e.cohorts : e.gridCohort;
+      return !coh || coh.includes(group);
+    };
+    for (const e of wp.entries) {
+      if (e.kind === 'skills' && e.gridCohort && !e.gridCohort.includes(group)) continue; // steht im Raster der anderen Hälfte
+      if (!mine(e)) continue;
+      if (e.weeksOnly && (e.weekNo < e.weeksOnly[0] || e.weekNo > e.weeksOnly[1])) continue;
+      if (!e.date) continue;
+      let title = e.title, gname = '';
+      if (e.kind === 'module') { const topic = e.assign && e.assign[group]; title = topic ? `Module ${topic}` : 'Module'; if (topic && !seenAssign.has(e.weekNo)) seenAssign.add(e.weekNo); }
+      if (e.kind === 'skills') gname = `Gruppe ${e.skillsGroup}`;
+      const d = new Date(e.date + 'T00:00:00Z');
+      const key = [title, gname, e.weekday, e.start, e.end].join('|');
+      if (!byKey.has(key)) byKey.set(key, { code: title, name: title, group: gname, kind: e.kind, weekday: e.weekday, start: e.start, end: e.end, keys: new Set(), dates: [], notes: new Set() });
+      const ev = byKey.get(key); ev.keys.add(isoKey(d)); ev.dates.push(e.date); if (e.note) ev.notes.add(e.note);
+    }
+    const events = [...byKey.values()].map(ev => ({
+      code: ev.code, group: ev.group, name: ev.name,
+      type: ev.kind === 'lecture' ? 'Vorlesung' : undefined, typeConfirmed: ev.kind === 'lecture',
+      active: ev.kind === 'skills' ? false : undefined,
+      weekday: ev.weekday, start: ev.start, end: ev.end, timeSure: ev.end != null, room: '', instructor: '',
+      weeksRaw: [...ev.keys].sort((a, b) => a - b).map(k => k % 100).join(','), dates: ev.dates.sort(),
+      unknown: [], note: [...ev.notes].join(', '),
+    }));
+    events.sort((a, b) => a.code.localeCompare(b.code, 'de') || a.weekday - b.weekday || a.start - b.start);
+    if (events.some(e => e.code === 'SkillsLab')) warnings.push({ text: `SkillsLab: laut PDF „2× pro Student“ – an welchen Tagen du dran bist, steht nicht im PDF. Deshalb ist das Fach ausgeschaltet; unter „Fächer“ einschalten, wenn du deine Termine kennst.${skills == null ? ' Deine SkillsLab-Gruppe (1 oder 2) hast du nicht angegeben – beide Zeiten sind als Wahl angelegt.' : ''}` });
+    const digi = events.filter(e => e.end == null);
+    if (digi.length) warnings.push({ text: `Skillslab Digitalisierungskurs: Tag und Beginn stehen im PDF, das Ende nicht – bitte bei der Prüfung eintragen (${digi.length} Termin${digi.length > 1 ? 'e' : ''}).` });
+    if (wp.entries.some(e => e.kind === 'module' && e.assign && Object.keys(e.assign).length)) warnings.push({ text: '„Module“: zugeordnet nach „Gruppe X: Thema“ im jeweiligen Wochenraster – nur die dort genannten Gruppen haben in dieser Woche Module. Bitte prüfen.' });
+    for (const n of wp.notes || []) warnings.push({ text: 'Hinweis im PDF: ' + n });
+    for (const w of wp.warnings || []) warnings.push(w);
+    return { events, warnings, meta: wp.meta };
+  }
+
+  return { detect, parse, toEvents, cellEntries };
+})();
+if (typeof module !== 'undefined') module.exports = WeekGridParser;
+
 /* ===== PDF-Import: liest Stundenplan-Raster-PDFs (Zeit = Zeilen, Tage = Spalten) =====
    Hauptweg: Rechtecke direkt aus den Zeichenbefehlen der PDF (kein Zeichnen, keine Schriften nötig).
    Reserve:  Seite auf ein Canvas zeichnen und Blöcke an den Pixeln erkennen. */
@@ -694,7 +988,8 @@ const SPParser = (() => {
     const ops = lib.OPS;
     const legacyMinMax = parseInt(String(lib.version || '4'), 10) < 4;
     const ol = await page.getOperatorList();
-    const shapes = [];
+    const shapes = [], thin = [];
+    shapes.thin = thin;
     let ctm = [1, 0, 0, 1, 0, 0]; const stack = [];
     let fill = null;
     const isPaint = (op) => [ops.fill, ops.eoFill, ops.fillStroke, ops.eoFillStroke, ops.closeFillStroke, ops.closeEOFillStroke, ops.stroke, ops.closeStroke].includes(op);
@@ -724,6 +1019,7 @@ const SPParser = (() => {
         const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
         const s = { x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys), fill };
         if (s.x1 - s.x0 > 4 && s.y1 - s.y0 > 4) shapes.push(s);
+        else if (Math.max(s.x1 - s.x0, s.y1 - s.y0) > 6) thin.push(s); // Rahmenlinien (Tabellen aus Excel)
       }
     }
     return shapes;
@@ -773,6 +1069,7 @@ const SPParser = (() => {
     catch (e) { throw stageError('PDF öffnen', e); }
     const result = { meta: {}, events: [], warnings: [], pages: doc.numPages, method: new Set() };
     const pageTexts = []; // für den Listen-Leser (Stundenpläne ohne Raster)
+    const pageGeo = [];   // für den Wochenablaufplan-Leser (ein Raster je Woche, mit Rahmenlinien)
     for (let n = 1; n <= doc.numPages; n++) {
       let page, vp, items, shapes = [];
       try {
@@ -790,6 +1087,7 @@ const SPParser = (() => {
         pageTexts.push(items.map(i => ({ str: i.str, x: i.x, rx: i.x / vp.width, top: i.top, h: i.h })));
       } catch (e) { throw stageError(`Text auf Seite ${n} lesen`, e); }
       try { shapes = await extractShapes(lib, page, vp); } catch (e) { log.push(`Seite ${n}: Rechtecke nicht lesbar – ${e.message}`); }
+      pageGeo.push({ items, lines: shapes.thin || [], W: vp.width, H: vp.height });
       let px = null;
       const getPx = async () => {
         if (px || !canRender) return px;
@@ -805,9 +1103,17 @@ const SPParser = (() => {
       try { page.cleanup(); } catch (e) { /* egal */ }
     }
     try { await doc.destroy(); } catch (e) { /* egal */ }
+    // Wochenablaufplan: ein eigenes Raster je Woche mit Datum (z. B. Medizin) – Gruppen werden erst nach Rückfrage gefiltert
+    const WG = typeof WeekGridParser !== 'undefined' ? WeekGridParser : (typeof require === 'function' ? (() => { try { return require('./weekgrid.js'); } catch (e) { return null; } })() : null);
+    if (WG && WG.detect(pageGeo)) {
+      try {
+        const wp = WG.parse(pageGeo);
+        if (wp.entries.length) { result.weekplan = wp; result.meta = wp.meta; result.events = []; result.warnings = []; result.method.add('wochenplan'); log.push(`Wochenablaufplan erkannt: ${wp.weeks.length} Wochenraster, ${wp.entries.length} Einträge`); }
+      } catch (e) { log.push('Wochenplan-Leser: ' + e.message); }
+    }
     // Kein Raster gefunden → als Liste lesen (Datum/Zeitraum, Wochentag, Uhrzeit, Raum je Zeile)
     const LP = typeof ListParser !== 'undefined' ? ListParser : (typeof require === 'function' ? (() => { try { return require('./listparser.js'); } catch (e) { return null; } })() : null);
-    if (!result.events.length && LP) {
+    if (!result.events.length && !result.weekplan && LP) {
       let lr = null;
       try { lr = LP.parse(pageTexts); } catch (e) { log.push('Listen-Leser: ' + e.message); }
       if (lr && lr.events.length) {
@@ -1029,7 +1335,7 @@ const Core = (() => {
       const base = raw.group !== undefined ? raw.code : m[1], gname = raw.group !== undefined ? raw.group : (m[2] || '');
       let course = st.courses.find(c => c.semesterId === semesterId && c.code === base);
       if (!course) {
-        course = { id: uid('c'), semesterId, code: base, name: raw.name || base, type: raw.type || guessType(base), typeConfirmed: !!raw.typeConfirmed, mandatory: raw.mandatory === false ? false : null, active: true, groupMode: 'alternative', groupsConfirmed: false };
+        course = { id: uid('c'), semesterId, code: base, name: raw.name || base, type: raw.type || guessType(base), typeConfirmed: !!raw.typeConfirmed, mandatory: raw.mandatory === false ? false : null, active: raw.active === false ? false : true, groupMode: 'alternative', groupsConfirmed: false };
         st.courses.push(course);
       }
       let group = st.groups.find(g => g.courseId === course.id && g.name === gname);
@@ -2986,7 +3292,7 @@ const Acct = {
   clearUiData() {
     if (ui.lastDownload) { try { URL.revokeObjectURL(ui.lastDownload.url); } catch (e) { /* */ } }
     for (const k of ['results', 'plan', 'importPreview', 'alt', 'lastChange', 'lastDownload', 'exportError', 'editEvent', 'confirmDelete', 'confirmOff', 'wiConfirm',
-      'reviewSem', 'pdfReport', 'importNotes', 'parseError', 'parsing', 'apptForm', 'apptOpen', 'apptRef', 'apptDel', 'fw', 'check', 'anonConfirm', 'wipeConfirm', 'wipeMsg', 'apptMove', 'cal']) ui[k] = null;
+      'reviewSem', 'pdfReport', 'importNotes', 'parseError', 'parsing', 'apptForm', 'apptOpen', 'apptRef', 'apptDel', 'fw', 'check', 'anonConfirm', 'wipeConfirm', 'wipeMsg', 'apptMove', 'cal', 'weekplanAsk']) ui[k] = null;
     ui.calOff = false; ui.calPreview = false; ui.semForm = false; ui.touched = false; ui.planKw = ''; ui.dismissed = new Set();
     this.conflicts = [];
   },
@@ -3540,7 +3846,7 @@ function viewSemester() {
     <p class="muted">Lade die offiziellen Stundenplan-PDFs hoch. Alles, was ich erkenne, zeige ich dir zur Prüfung an – gerechnet wird erst, wenn die Daten eindeutig sind.</p></div>
   <div class="drop" id="drop">
     <div class="row"><h2>Stundenplan-PDF hochladen</h2></div>
-    <p class="muted small">Raster wie „Stundenplan für E2“ (Uhrzeiten links, Wochentage oben, Kalenderwochen im Block) oder Liste mit Datum/Zeitraum, Wochentag, Uhrzeit und Raum je Zeile (z. B. „Vorlesung 13.10. – 15.12. Di 13.00 – 15.00 HS HW“). Mehrere Dateien gleichzeitig sind möglich.</p>
+    <p class="muted small">Raster wie „Stundenplan für E2“, Wochenablaufpläne mit einem Raster je Woche (z. B. Medizin) oder Listen mit Datum, Wochentag und Uhrzeit je Zeile. Mehrere Dateien gleichzeitig sind möglich.</p>
     <div class="row">
       <label class="btn primary" for="pdfIn">PDF auswählen</label>
       <input type="file" id="pdfIn" accept="application/pdf,.pdf" multiple>
@@ -3549,6 +3855,7 @@ function viewSemester() {
       <span class="small muted">oder Datei hierher ziehen</span>
     </div>
     ${ui.parsing ? `<div class="row small"><span class="spin"></span> ${esc(ui.parsing)}</div>` : ''}
+    ${weekplanAskHtml()}
     ${ui.importNotes ? `<div class="alert info small" id="import-notes"><div class="row between"><b>Hinweise zu „${esc(ui.importNotes.file)}“${ui.importNotes.liste ? ' (als Liste gelesen)' : ''}</b><button class="btn ghost sm" data-act="notes-close">Schließen</button></div>${ui.importNotes.list.map(t => `<div>• ${esc(t)}</div>`).join('')}</div>` : ''}
     ${ui.parseError ? `<div class="alert bad small"><b>Import fehlgeschlagen.</b><span>${esc(ui.parseError.text || ui.parseError)}</span>${ui.parseError.detail ? `<details><summary>Technische Details</summary><pre class="mono" style="white-space:pre-wrap;margin:6px 0 0">${esc(ui.parseError.detail)}</pre></details>` : ''}</div>` : ''}
   </div>
@@ -3584,6 +3891,7 @@ function semCard(s) {
     <div class="row between"><div><div class="eyebrow">${esc(C.termLabel(s))}</div><h3>${esc(s.name)}</h3></div><div class="big">${esc(s.code || s.number || '')}</div></div>
     <div class="stats"><div><b>${cs.filter(c => c.active).length}/${cs.length}</b><span>Fächer aktiv</span></div><div><b>${alt}</b><span>mit Gruppenwahl</span></div><div><b>${evs.length}</b><span>Termine</span></div></div>
     ${files || '<p class="small muted">Noch kein PDF importiert.</p>'}
+    ${s.weekplan ? `<div class="row small" style="gap:6px"><span class="pill sig">Kursgruppe ${s.weekplan.group}${s.weekplan.skills ? ` · SkillsLab ${s.weekplan.skills}` : ''}</span><button class="btn ghost sm" data-act="wp-change" data-id="${s.id}">ändern</button></div>` : ''}
     <div>${bl ? `<span class="pill warn">${bl} ${bl === 1 ? 'Frage' : 'Fragen'} offen</span>` : cs.length ? '<span class="pill ok">Bestätigt</span>' : '<span class="pill">Leer</span>'}</div>
     <div class="row">
       <button class="btn ${bl ? 'primary' : ''} sm" data-act="review" data-id="${s.id}">${ui.reviewSem === s.id ? 'Prüfung schließen' : 'Prüfen &amp; bestätigen'}</button>
@@ -4219,19 +4527,13 @@ async function handleFiles(files) {
     ui.parsing = `Lese „${f.name}“ …`; render();
     try {
       const res = await SPParser.parseFile(f);
-      if (!res.events.length) { ui.parseError = { text: `In „${f.name}“ habe ich keine Termine gefunden. Lesen kann ich Raster-Stundenpläne (Uhrzeiten links, Tage oben) und Listen, in denen jede Zeile Datum oder Zeitraum, Wochentag und Uhrzeit nennt.`, detail: res.warnings.map(w => w.text).concat(res.log || []).join('\n') }; continue; }
-      let sem = ui.uploadTarget !== 'auto' ? semById(ui.uploadTarget) : st.semesters.find(s => res.meta.code && s.code === res.meta.code);
-      if (!sem) {
-        const t = res.meta.term ? { term: res.meta.term, startYear: res.meta.startYear } : C.guessTerm(res.events.flatMap(e => C.parseWeeks(e.weeksRaw).weeks), res.meta.standDate);
-        const num = res.meta.semesterNumber || (res.meta.code && /\d+/.test(res.meta.code) ? +res.meta.code.match(/\d+/)[0] : st.semesters.length + 1);
-        sem = { id: C.uid('s'), name: `Semester ${num}`, code: res.meta.code || '', number: num, term: t.term, startYear: t.startYear, files: [], createdAt: new Date().toISOString() };
-        st.semesters.push(sem);
+      if (res.weekplan) { // Wochenablaufplan: erst Kursgruppe erfragen, dann übernehmen
+        const fs = /(\d{1,2})\.?[_ ]*(?:FS|Fachsemester)/i.exec(f.name);
+        ui.weekplanAsk = { res, file: f.name, target: ui.uploadTarget, semNo: fs ? +fs[1] : null };
+        continue;
       }
-      let r; try { r = C.importParse(st, res, sem.id, f.name); } catch (e) { e.stage = 'Termine übernehmen'; throw e; }
-      ui.reviewSem = sem.id;
-      toast(r.added === 0 && r.dup > 0 ? `„${f.name}“ ist schon importiert – alle ${r.dup} Termine sind bereits in ${sem.name}.` : `${r.added} Termine aus „${f.name}“ erkannt${r.dup ? `, ${r.dup} schon vorhandene übersprungen` : ''}`);
-      ui.importNotes = res.warnings.length ? { file: f.name, list: res.warnings.map(w => w.text), liste: (res.method || []).includes('liste') } : null;
-      changed();
+      if (!res.events.length) { ui.parseError = { text: `In „${f.name}“ habe ich keine Termine gefunden. Lesen kann ich Raster-Stundenpläne (Uhrzeiten links, Tage oben), Wochenablaufpläne mit einem Raster je Woche und Listen, in denen jede Zeile Datum oder Zeitraum, Wochentag und Uhrzeit nennt.`, detail: res.warnings.map(w => w.text).concat(res.log || []).join('\n') }; continue; }
+      importResult(res, f.name, ui.uploadTarget);
     } catch (e) {
       const stage = e && e.stage || 'Lesen';
       ui.parseError = { text: stage === 'PDF-Leser laden' ? 'Der PDF-Leser konnte nicht geladen werden. Prüfe die Internetverbindung und versuche es erneut. Mit „Funktionen prüfen“ unten siehst du, was in deiner Umgebung blockiert ist.' : `„${f.name}“ konnte nicht gelesen werden (Schritt: ${stage}).`, detail: [String(e && e.message || e)].concat(e && e.log || SPParser.log.slice(-6)).join('\n') };
@@ -4239,7 +4541,56 @@ async function handleFiles(files) {
     }
   }
   ui.parsing = null; render();
-  if (ui.reviewSem) { const el = $('#review'); el && el.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+  if (ui.weekplanAsk) { const el = $('#wp-ask'); el && el.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+  else if (ui.reviewSem) { const el = $('#review'); el && el.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+}
+/** Erkannte Termine ins gewählte (oder neue) Semester übernehmen */
+function importResult(res, fname, target, semId) {
+  let sem = semId ? semById(semId) : target && target !== 'auto' ? semById(target) : st.semesters.find(s => res.meta.code && s.code === res.meta.code);
+  if (!sem) {
+    const t = res.meta.term ? { term: res.meta.term, startYear: res.meta.startYear } : C.guessTerm(res.events.flatMap(e => C.parseWeeks(e.weeksRaw).weeks), res.meta.standDate);
+    const num = res.meta.semesterNumber || (res.meta.code && /\d+/.test(res.meta.code) ? +res.meta.code.match(/\d+/)[0] : st.semesters.length + 1);
+    sem = { id: C.uid('s'), name: `Semester ${num}`, code: res.meta.code || '', number: num, term: t.term, startYear: t.startYear, files: [], createdAt: new Date().toISOString() };
+    st.semesters.push(sem);
+  }
+  let r; try { r = C.importParse(st, res, sem.id, fname); } catch (e) { e.stage = 'Termine übernehmen'; throw e; }
+  ui.reviewSem = sem.id;
+  toast(r.added === 0 && r.dup > 0 ? `„${fname}“ ist schon importiert – alle ${r.dup} Termine sind bereits in ${sem.name}.` : `${r.added} Termine aus „${fname}“ erkannt${r.dup ? `, ${r.dup} schon vorhandene übersprungen` : ''}`);
+  ui.importNotes = res.warnings.length ? { file: fname, list: res.warnings.map(w => w.text), liste: (res.method || []).includes('liste') } : null;
+  changed();
+  return sem;
+}
+/* ---------- Wochenablaufplan: Kursgruppe abfragen, dann nur die eigenen Termine übernehmen ---------- */
+function weekplanAskHtml() {
+  const a = ui.weekplanAsk; if (!a) return '';
+  const wp = a.res.weekplan, max = wp.meta.cohortMax || 12, weeks = new Set(wp.weeks.map(w => w.weekNo)).size;
+  const hasSkills = wp.entries.some(e => e.kind === 'skills');
+  const cur = a.semId ? semById(a.semId) && semById(a.semId).weekplan : null;
+  return `<div class="alert info" id="wp-ask"><b>Wochenablaufplan erkannt: ${weeks} Wochen, Kursgruppen 1–${max}.</b>
+    <span class="small">Vorlesungen ohne Gruppennummer gelten für alle. Kurse übernehme ich nur, wenn deine Nummer dabeisteht; ab Woche 7 nur das Raster deiner Hälfte.</span>
+    <div class="row">
+      <label class="field">Deine Kursgruppe<select id="wp-group"><option value="">bitte wählen</option>${Array.from({ length: max }, (_, i) => i + 1).map(n => `<option value="${n}" ${cur && cur.group === n ? 'selected' : ''}>Gruppe ${n}</option>`).join('')}</select></label>
+      ${hasSkills ? `<label class="field">SkillsLab-Gruppe<select id="wp-skills"><option value="">weiß ich nicht</option><option value="1" ${cur && cur.skills === 1 ? 'selected' : ''}>Gruppe 1 (vormittags)</option><option value="2" ${cur && cur.skills === 2 ? 'selected' : ''}>Gruppe 2 (nachmittags)</option></select></label>` : ''}
+    </div>
+    <div class="row"><button class="btn primary" data-act="wp-yes">Übernehmen</button><button class="btn" data-act="wp-no">Abbrechen</button></div></div>`;
+}
+function weekplanImport() {
+  const a = ui.weekplanAsk; if (!a) return;
+  const g = +($('#wp-group') || {}).value; if (!g) { toast('Bitte zuerst deine Kursgruppe wählen.'); return; }
+  const sv = $('#wp-skills') ? $('#wp-skills').value : ''; const sk = sv ? +sv : null;
+  const conv = WeekGridParser.toEvents(a.res.weekplan, g, sk);
+  const res = { events: conv.events, warnings: conv.warnings, meta: { ...a.res.meta, code: '', semesterNumber: a.semNo || a.res.meta.semesterNumber }, method: ['wochenplan'] };
+  if (a.semId) { // Kursgruppe ändern: bisherige Fächer dieses Semesters ersetzen
+    const cids = st.courses.filter(c => c.semesterId === a.semId).map(c => c.id), gids = st.groups.filter(x => cids.includes(x.courseId)).map(x => x.id);
+    st.events = st.events.filter(e => !gids.includes(e.groupId)); st.groups = st.groups.filter(x => !cids.includes(x.courseId)); st.courses = st.courses.filter(c => c.semesterId !== a.semId);
+    const s0 = semById(a.semId); if (s0) s0.files = [];
+    ui.plan = null; ui.results = null;
+  }
+  const sem = importResult(res, a.file, a.target, a.semId);
+  // gelesene Einträge behalten (ohne Rohtext), damit die Kursgruppe später ohne PDF geändert werden kann
+  sem.weekplan = { file: a.file, group: g, skills: sk, data: { weeks: a.res.weekplan.weeks.map(w => ({ weekNo: w.weekNo, cohort: w.cohort })), notes: a.res.weekplan.notes, warnings: a.res.weekplan.warnings, meta: a.res.weekplan.meta,
+    entries: a.res.weekplan.entries.map(e => { const { src, weekLabel, page, timeSet, ...rest } = e; return rest; }) } };
+  ui.weekplanAsk = null; changed(); render();
 }
 function readEventForm(id) {
   const e = st.events.find(x => x.id === id);
@@ -4295,6 +4646,9 @@ async function onClick(ev) {
       st.semesters.push({ id: C.uid('s'), name: `Semester ${num}`, code: $('#ns-code').value.trim(), number: num, term: $('#ns-term').value, startYear: +$('#ns-year').value || new Date().getFullYear(), files: [], createdAt: new Date().toISOString() });
       ui.semForm = false; changed(); render(); break;
     }
+    case 'wp-yes': weekplanImport(); break;
+    case 'wp-no': ui.weekplanAsk = null; render(); break;
+    case 'wp-change': { const sm = semById(id); if (sm && sm.weekplan) { ui.weekplanAsk = { res: { weekplan: sm.weekplan.data, meta: sm.weekplan.data.meta }, file: sm.weekplan.file, target: id, semId: id, semNo: sm.number }; ui.tab = 'semester'; render(); const el = $('#wp-ask'); el && el.scrollIntoView({ behavior: 'smooth', block: 'center' }); } break; }
     case 'sem-del': ui.confirmDelete = id; render(); break;
     case 'sem-del-no': case 'saved-del-no': ui.confirmDelete = null; render(); break;
     case 'sem-del-yes': {
