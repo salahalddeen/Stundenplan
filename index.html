@@ -10,7 +10,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-<script>window.SPO_VERSION = {"name": "1.7", "build": "39e3fc4d61", "date": "20.10.2026 10:27"};</script>
+<script>window.SPO_VERSION = {"name": "1.7.1", "build": "0cb29ca865", "date": "20.10.2026 11:28"};</script>
 <script src="config.js"></script>
 <title>Stundenplan-Optimierer</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -5265,14 +5265,25 @@ function checkPanel() {
 (function () {
   if (!('serviceWorker' in navigator) || location.protocol === 'file:') return;
   let waiting = null, reloading = false, wanted = false;
-  const show = (w) => { waiting = w; const b = document.getElementById('updbar'); if (b) b.hidden = false; };
-  navigator.serviceWorker.register('sw.js').then((reg) => {
-    if (reg.waiting && navigator.serviceWorker.controller) show(reg.waiting);
-    reg.addEventListener('updatefound', () => {
-      const w = reg.installing; if (!w) return;
-      w.addEventListener('statechange', () => { if (w.state === 'installed' && navigator.serviceWorker.controller) show(w); });
-    });
-    const check = () => reg.update().catch(() => {});
+  const t0 = Date.now();
+  const apply = (w) => { try { if (typeof Store !== 'undefined' && Store.timer) { clearTimeout(Store.timer); Store.flush(); } } catch (e) {} wanted = true; w.postMessage('SKIP_WAITING'); };
+  // Gerade erst geöffnet und noch nichts eingegeben → neue Version sofort übernehmen; sonst Hinweis zeigen (du entscheidest)
+  const show = (w) => {
+    waiting = w;
+    const fresh = Date.now() - t0 < 20000 && !(typeof ui !== 'undefined' && ui.touched);
+    if (fresh || document.visibilityState === 'hidden') { apply(w); return; }
+    const b = document.getElementById('updbar'); if (b) b.hidden = false;
+  };
+  const track = (w) => {
+    if (!w || !navigator.serviceWorker.controller) return;
+    if (w.state === 'installed') { show(w); return; }
+    w.addEventListener('statechange', () => { if (w.state === 'installed') show(w); });
+  };
+  navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then((reg) => {
+    track(reg.waiting); track(reg.installing); // auch ein Update, das schon vor dem Start begonnen hat
+    reg.addEventListener('updatefound', () => track(reg.installing));
+    const check = () => reg.update().then(() => { track(reg.waiting); }).catch(() => {});
+    check();
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') check(); });
     setInterval(check, 30 * 60 * 1000);
   }).catch(() => {});
@@ -5281,9 +5292,8 @@ function checkPanel() {
   document.addEventListener('click', (ev) => {
     if (ev.target && ev.target.id === 'updbtn' && waiting) {
       // ausstehende Änderungen vorher speichern
-      try { if (typeof Store !== 'undefined' && Store.timer) { clearTimeout(Store.timer); Store.flush(); } } catch (e) {}
-      wanted = true; ev.target.disabled = true; ev.target.textContent = 'Wird aktualisiert …';
-      waiting.postMessage('SKIP_WAITING');
+      ev.target.disabled = true; ev.target.textContent = 'Wird aktualisiert …';
+      apply(waiting);
     }
   });
 })();
