@@ -10,7 +10,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-<script>window.SPO_VERSION = {"name": "1.7.2", "build": "4f3e05582f", "date": "21.10.2026 08:25"};</script>
+<script>window.SPO_VERSION = {"name": "1.8", "build": "1472983980", "date": "21.10.2026 14:02"};</script>
 <script src="config.js"></script>
 <title>Stundenplan-Optimierer</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -297,6 +297,15 @@ input[type="date"] { font: 500 .95rem var(--f-body); color: var(--ink); backgrou
 .mdot { display: none; width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
 .mdot.bad { background: var(--bad); } .mdot.warn { background: var(--warn); }
 @media (max-width: 560px) { .mday { min-height: 54px; align-items: center; } .mp { display: none; } .muni { font-size: .62rem; } .mdot { display: block; } }
+.occpanel { display: grid; gap: 8px; margin-top: 8px; padding: 10px; border: 1px solid var(--line-soft); border-radius: 8px; background: var(--surface-2); }
+.occlist { display: grid; gap: 2px; max-height: 420px; overflow-y: auto; }
+.occ { display: grid; grid-template-columns: minmax(0, 15em) auto minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; padding: 4px 2px; border-bottom: 1px solid var(--line-soft); font-size: .84rem; }
+.occ .btn { min-height: 26px; padding: 0 8px; }
+@media (max-width: 560px) { .occ { grid-template-columns: minmax(0, 1fr) auto; } }
+.tlbtn { all: unset; box-sizing: border-box; display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 8px; padding: 4px 8px; border-radius: 6px; font-size: .84rem; align-items: center; cursor: pointer; width: 100%; background: var(--surface-2); color: var(--ink); }
+.tlbtn.clash { background: var(--bad-bg); color: var(--bad); }
+.tlbtn:focus-visible { outline: 2px solid var(--focus); }
+.occday { display: grid; gap: 6px; padding: 6px 8px 8px; border-left: 3px solid var(--signal); margin: 0 0 4px 6px; }
 </style>
 
 </head><body>
@@ -1443,7 +1452,7 @@ const Core = (() => {
   function prepEvent(st, e) {
     const g = st.groups.find(x => x.id === e.groupId); const c = courseOf(st, g); const sem = semOf(st, c);
     const keys = e.weeks.map(w => weekKey(sem, w)).sort((a, b) => a - b);
-    return { id: e.id, ref: e, groupId: g.id, groupName: g.name, courseId: c.id, label: groupLabel(st, g), course: c, sem, weekday: e.weekday, start: e.start, end: e.end, keys, room: e.room, instructor: e.instructor };
+    return { id: e.id, ref: e, groupId: g.id, groupName: g.name, courseId: c.id, label: groupLabel(st, g), course: c, sem, weekday: e.weekday, start: e.start, end: e.end, keys, room: e.room || c.place || '', instructor: e.instructor };
   }
   const overlap = (a, b) => a.weekday === b.weekday && a.start < b.end && b.start < a.end;
   function commonKeys(a, b) { const s = new Set(a.keys); return b.keys.filter(k => s.has(k)); }
@@ -1738,8 +1747,9 @@ const Core = (() => {
     for (const e of list) {
       const k = [e.groupId, e.weekday, e.start, e.end].join('|');
       const x = m.get(k);
-      if (!x) m.set(k, { ...e, ids: [e.id] });
-      else { x.ids.push(e.id); x.keys = [...new Set(x.keys.concat(e.keys))].sort((a, b) => a - b); x.room = join(x.room, e.room); x.instructor = join(x.instructor, e.instructor); }
+      const rk = {}; (e.keys || []).forEach(q => { rk[q] = e.room || ''; });
+      if (!x) m.set(k, { ...e, ids: [e.id], roomByKey: rk });
+      else { x.ids.push(e.id); x.keys = [...new Set(x.keys.concat(e.keys))].sort((a, b) => a - b); x.room = join(x.room, e.room); x.instructor = join(x.instructor, e.instructor); Object.assign(x.roomByKey, rk); }
     }
     return [...m.values()];
   }
@@ -1761,7 +1771,7 @@ const Core = (() => {
       const named = e.course.name && e.course.name !== e.course.code;
       const summary = `${named ? e.course.name + ' · ' : ''}${e.label} (${typeLabel(e.course)})`;
       const description = `${e.instructor ? 'Dozent: ' + e.instructor + '\n' : ''}${keyLabel(k)} · alle Termine: KW ${compressKeys(e.keys)}`;
-      const it = { uid, date: day, dateObj: d, key: k, weekday: e.weekday, start: e.start, end: e.end, summary, location: e.room || '', description, groupLabel: e.label, courseId: e.courseId };
+      const it = { uid, date: day, dateObj: d, key: k, weekday: e.weekday, start: e.start, end: e.end, summary, location: (e.roomByKey && e.roomByKey[k] != null ? e.roomByKey[k] : e.room) || '', description, groupLabel: e.label, courseId: e.courseId };
       it.hash = hashStr([it.start, it.end, it.summary, it.location, it.description].join('|'));
       items.push(it);
     }
@@ -1803,10 +1813,106 @@ const Core = (() => {
   /** was im Sync-Zustand pro Termin gemerkt wird (genug, um ihn später abzusagen) */
   const syncRecord = (it) => ({ hash: it.hash, date: it.date, start: it.start, end: it.end, summary: it.summary, groupLabel: it.groupLabel });
 
+  /* ---------- Einzelne Termine: Ort ändern, entfernen, wiederherstellen, hinzufügen ----------
+     Ein Termin = ein Datum einer Veranstaltungsreihe (Event mit Wochentag, Zeit und Liste von KW).
+     Jede Änderung wird zusätzlich in st.occEdits festgehalten (Fach-Kürzel, Gruppe, Datum, Zeit), damit sie nach einem
+     erneuten Übernehmen (z. B. „Kursgruppe ändern“) wieder angewendet werden kann. */
+  const ymdOf = (d) => `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  const isoOf = (d) => { const t = new Date(d.getTime()); t.setUTCDate(t.getUTCDate() + 3 - ((d.getUTCDay() + 6) % 7)); const y = t.getUTCFullYear(), j4 = new Date(Date.UTC(y, 0, 4)); return y * 100 + 1 + Math.round((t - j4) / 864e5 / 7 - (3 - ((j4.getUTCDay() + 6) % 7)) / 7); };
+  function evCtx(st, e) { const g = st.groups.find(x => x.id === e.groupId); const c = g && courseOf(st, g); return { g, c, sem: c && semOf(st, c) }; }
+  /** alle Einzeltermine eines Fachs (sortiert nach Datum) */
+  function occurrencesOf(st, courseId) {
+    const c = st.courses.find(x => x.id === courseId); if (!c) return [];
+    const sem = semOf(st, c), out = [];
+    for (const g of groupsOf(st, c.id)) for (const e of eventsOf(st, g.id)) {
+      if (e.weekday == null || e.start == null) continue;
+      for (const w of e.weeks) { const k = weekKey(sem, w), d = dateOf(k, e.weekday); out.push({ e, g, w, key: k, d, date: ymdOf(d), start: e.start, end: e.end, room: e.room || c.place || '', own: !!e.room, manual: !!e.manual }); }
+    }
+    return out.sort((a, b) => a.d - b.d || a.start - b.start);
+  }
+  const sameSlot = (x, e) => x.groupId === e.groupId && x.weekday === e.weekday && x.start === e.start && x.end === e.end && (x.room || '') === (e.room || '') && (x.instructor || '') === (e.instructor || '');
+  function setWeeks(st, e, weeks) {
+    const { sem } = evCtx(st, e);
+    e.weeks = sortWeeks(sem, [...new Set(weeks)]); e.weeksRaw = e.weeks.join(',');
+    if (!e.weeks.length) st.events = st.events.filter(x => x !== e);
+  }
+  function editRecord(st, e, w, extra) {
+    const { g, c, sem } = evCtx(st, e); const d = dateOf(weekKey(sem, w), e.weekday);
+    return { sem: sem && sem.id, code: c.code, group: g.name, date: ymdOf(d), weekday: e.weekday, start: e.start, end: e.end, at: new Date().toISOString(),
+      snap: { room: e.room || '', instructor: e.instructor || '', manual: !!e.manual }, ...extra };
+  }
+  const editsOf = (st) => st.occEdits || (st.occEdits = []);
+  const sameEdit = (a, b) => a.sem === b.sem && a.code === b.code && a.group === b.group && a.date === b.date && a.start === b.start;
+  /** einen Termin (Datum) aus seiner Reihe entfernen */
+  function removeOcc(st, eventId, w, record = true) {
+    const e = st.events.find(x => x.id === eventId); if (!e || !e.weeks.includes(w)) return null;
+    const rec = editRecord(st, e, w, { action: 'remove' });
+    setWeeks(st, e, e.weeks.filter(x => x !== w));
+    if (record) { const L = editsOf(st); const i = L.findIndex(x => sameEdit(x, rec)); if (i >= 0) L.splice(i, 1); L.push(rec); }
+    return rec;
+  }
+  /** Ort nur für dieses Datum: Termin aus der Reihe lösen und mit eigenem Ort anlegen */
+  function setOccPlace(st, eventId, w, place, record = true) {
+    const e = st.events.find(x => x.id === eventId); if (!e || !e.weeks.includes(w)) return null;
+    place = String(place || '').trim();
+    const rec = editRecord(st, e, w, { action: 'place', place });
+    let target = e;
+    if (e.weeks.length > 1) {
+      setWeeks(st, e, e.weeks.filter(x => x !== w));
+      target = { ...JSON.parse(JSON.stringify(e)), id: uid('e'), weeks: [w], weeksRaw: String(w), single: true };
+      st.events.push(target);
+    }
+    target.room = place;
+    // passende Reihe mit gleichem Ort vorhanden? → wieder zusammenführen
+    const twin = st.events.find(x => x !== target && sameSlot(x, target));
+    if (twin) { setWeeks(st, twin, twin.weeks.concat(target.weeks)); st.events = st.events.filter(x => x !== target); target = twin; }
+    if (record) { const L = editsOf(st); const i = L.findIndex(x => sameEdit(x, rec) && x.action === 'place'); if (i >= 0) L.splice(i, 1); L.push(rec); }
+    return target;
+  }
+  /** entfernten Termin zurückholen */
+  function restoreOcc(st, rec) {
+    const sem = st.semesters.find(s => s.id === rec.sem); const c = st.courses.find(x => x.semesterId === rec.sem && x.code === rec.code); if (!c) return false;
+    const g = groupsOf(st, c.id).find(x => x.name === rec.group) || groupsOf(st, c.id)[0]; if (!g) return false;
+    const w = isoOf(new Date(rec.date + 'T00:00:00Z')) % 100;
+    const probe = { groupId: g.id, weekday: rec.weekday, start: rec.start, end: rec.end, room: rec.snap.room, instructor: rec.snap.instructor };
+    const twin = st.events.find(x => sameSlot(x, probe));
+    if (twin) setWeeks(st, twin, twin.weeks.concat([w]));
+    else st.events.push({ id: uid('e'), ...probe, weeks: [w], weeksRaw: String(w), timeSure: true, unknown: [], source: 'wiederhergestellt', confirmed: true, manual: rec.snap.manual });
+    st.occEdits = editsOf(st).filter(x => x !== rec);
+    return true;
+  }
+  /** neuer Termin für ein Fach (einmalig oder wöchentlich bis „until“) */
+  function addOcc(st, courseId, { groupId, date, start, end, room = '', until = '' }) {
+    const c = st.courses.find(x => x.id === courseId); const sem = semOf(st, c);
+    const g = groupId ? st.groups.find(x => x.id === groupId) : groupsOf(st, c.id)[0]; if (!g) return null;
+    const d0 = new Date(date + 'T00:00:00Z'), wd = (d0.getUTCDay() + 6) % 7, weeks = [];
+    const last = until ? new Date(until + 'T00:00:00Z') : d0;
+    for (let d = d0, i = 0; d <= last && i < 60; d = new Date(d.getTime() + 7 * 864e5), i++) weeks.push(isoOf(d) % 100);
+    const e = { id: uid('e'), groupId: g.id, weekday: wd, start, end, room: String(room || '').trim(), instructor: '', weeks: sortWeeks(sem, weeks), weeksRaw: '', timeSure: true, unknown: [], source: 'von dir hinzugefügt', confirmed: true, manual: true };
+    e.weeksRaw = e.weeks.join(',');
+    st.events.push(e);
+    return e;
+  }
+  /** nach erneutem Übernehmen: gespeicherte Änderungen dieses Semesters wieder anwenden */
+  function applyOccEdits(st, semId) {
+    let applied = 0;
+    for (const rec of editsOf(st).filter(x => x.sem === semId)) {
+      const c = st.courses.find(x => x.semesterId === semId && x.code === rec.code); if (!c) continue;
+      const sem = semOf(st, c), w = isoOf(new Date(rec.date + 'T00:00:00Z')) % 100;
+      const gids = groupsOf(st, c.id).filter(g => g.name === rec.group).map(g => g.id);
+      const e = st.events.find(x => gids.includes(x.groupId) && x.weekday === rec.weekday && x.start === rec.start && x.weeks.includes(w));
+      if (!e) continue;
+      if (rec.action === 'remove') removeOcc(st, e.id, w, false); else setOccPlace(st, e.id, w, rec.place, false);
+      applied++;
+    }
+    return applied;
+  }
+
   return {
     DAYS, DS, uid, toMin, fmt, fmtDur, typeLabel, parseWeeks, compressWeeks, compressKeys, sortWeeks, weekKey, keyLabel, dateOf, semYear, termLabel,
     guessTerm, importParse, eventIssues, semesterQuestions, groupsOf, eventsOf, courseOf, semOf, groupLabel,
     buildProblem, solve, rank, metrics, CRITERIA, penalty, reparseSemester, selectionOf, evaluateSelection, conflictText, diagnose, softNotes, buildICS, calendarItems, syncDiff, syncRecord, mergeSlots, hashStr, prepEvent, optionConflicts,
+    occurrencesOf, removeOcc, setOccPlace, restoreOcc, addOcc, applyOccEdits,
   };
 })();
 if (typeof module !== 'undefined') module.exports = Core;
@@ -3214,8 +3320,10 @@ function dayData(ref, d) {
     const f = a.done || a.decision === 'skip' ? null : A.feasibility(ref.evs, a, o, activeAppts(), ref.sem);
     return { a, start: o.start, end: o.end, status: a.done ? 'done' : a.decision === 'skip' ? 'skip' : f.status, reason: f ? f.reason : '' };
   }));
-  const uni = C.mergeSlots(ref.evs).filter(e => e.weekday === wd && e.keys.includes(key)).map(e => ({
-    e, start: e.start, end: e.end, name: A.evName(e), group: e.label, room: e.room,
+  // erst nach Datum filtern, dann zusammenfassen – so stimmt der Ort je Termin
+  const uni = C.mergeSlots(ref.evs.filter(e => e.weekday === wd && e.keys.includes(key))).map(e => ({
+    e, start: e.start, end: e.end, name: A.evName(e), group: e.label, room: (e.roomByKey && e.roomByKey[key] != null ? e.roomByKey[key] : e.room),
+    eid: (e.ids || [e.id]).find(id => { const x = st.events.find(y => y.id === id); return x && x.weeks.includes(key % 100); }), w: key % 100,
     clash: pers.some(p => p.status === 'bad' && p.start < e.end && e.start < p.end) }));
   return { d, date, key, wd, uni: uni.sort((x, y) => x.start - y.start), pers: pers.sort((x, y) => x.start - y.start) };
 }
@@ -3224,7 +3332,7 @@ const PLABEL = { ok: '✓', tight: '⚠ knapp', bad: '✗ nicht machbar', unknow
 
 function viewCalendar() {
   const ref = refInfo();
-  const head = `<div class="lead"><h1>Kalender</h1><p class="muted">Hochschule und deine Termine zusammen. Rot = nicht machbar, gelb = knapp.</p></div>`;
+  const head = `<div class="lead"><h1>Kalender</h1><p class="muted">Hochschule und deine Termine zusammen. Rot = nicht machbar, gelb = knapp. In der Tagesansicht eine Vorlesung antippen, um ihren Ort zu ändern oder sie zu entfernen.</p></div>`;
   if (!ref) return head + `<div class="alert info"><b>Noch kein Stundenplan.</b><span>Öffne unter „Pläne“ einen Plan oder speichere einen.</span><div><button class="btn primary" data-act="tab" data-id="plaene">Zu den Plänen</button></div></div>`;
   const cs = calState(ref), d = A.parseYmd(cs.date);
   const title = cs.view === 'tag' ? A.fmtDate(d) : cs.view === 'woche' ? `KW ${A.isoKey(d) % 100} · ${A.fmtDate(A.addDays(d, -A.weekdayOf(d)), false)} – ${A.fmtDate(A.addDays(d, 6 - A.weekdayOf(d)), false)}`
@@ -3236,6 +3344,7 @@ function viewCalendar() {
       <div class="row" style="gap:6px"><button class="btn sm" data-act="cal-nav" data-v="-1" aria-label="zurück">←</button><button class="btn sm" data-act="cal-today">Heute</button><button class="btn sm" data-act="cal-nav" data-v="1" aria-label="weiter">→</button></div>
     </div>
     <div class="row between"><b id="caltitle">${esc(title)}</b><span class="small muted">Geprüft gegen: ${esc(ref.label)}</span></div>
+    ${ui.lastRemoved ? `<div class="alert info small row between"><span>Termin am ${esc(A.fmtDate(A.parseYmd(ui.lastRemoved.date)))} entfernt.</span><button class="btn sm" data-act="occ-undo">Rückgängig</button></div>` : ''}
     ${body}
   </section>`;
 }
@@ -3245,7 +3354,11 @@ function persChip(p, withReason) {
 function calDay(ref, d) {
   const dd = dayData(ref, d);
   const rows = [];
-  for (const u of dd.uni) rows.push({ t: u.start, html: `<div class="tl uni${u.clash ? ' clash' : ''}"><span class="mono">${t2(u.start, u.end)}</span><span><b>${esc(u.name)}</b> <span class="small muted">${esc(u.group)}${u.room ? ' · ' + esc(u.room) : ''}</span></span></div>` });
+  for (const u of dd.uni) {
+    const k = u.eid + ':' + u.w, open = ui.occEdit === k;
+    rows.push({ t: u.start, html: `<button class="tl uni tlbtn${u.clash ? ' clash' : ''}" data-act="occ-place" data-eid="${u.eid}" data-w="${u.w}" title="Antippen: Ort ändern oder Termin entfernen"><span class="mono">${t2(u.start, u.end)}</span><span><b>${esc(u.name)}</b> <span class="small muted">${u.group && u.group !== u.name ? esc(u.group) + ' · ' : ''}${u.room ? esc(u.room) : 'Ort unbekannt'}</span></span></button>
+      ${open ? `<div class="occday">${occEditorHtml(u.eid, u.w, u.room)}<div class="row small" style="gap:6px"><button class="btn sm ghost danger" data-act="occ-del" data-eid="${u.eid}" data-w="${u.w}">Diesen Termin entfernen</button><button class="btn sm ghost" data-act="occ-toggle" data-id="${u.e.courseId}" data-go="faecher">Alle Termine von ${esc(u.name)}</button></div></div>` : ''}` });
+  }
   for (const p of dd.pers) {
     const a = p.a, live = p.status !== 'done' && p.status !== 'skip';
     const bb = a.buffer ? +a.bufBefore || 0 : 0, ba = a.buffer ? +a.bufAfter || 0 : 0;
@@ -3330,7 +3443,7 @@ const Acct = {
   clearUiData() {
     if (ui.lastDownload) { try { URL.revokeObjectURL(ui.lastDownload.url); } catch (e) { /* */ } }
     for (const k of ['results', 'plan', 'importPreview', 'alt', 'lastChange', 'lastDownload', 'exportError', 'editEvent', 'confirmDelete', 'confirmOff', 'wiConfirm',
-      'reviewSem', 'pdfReport', 'importNotes', 'parseError', 'parsing', 'apptForm', 'apptOpen', 'apptRef', 'apptDel', 'fw', 'check', 'anonConfirm', 'wipeConfirm', 'wipeMsg', 'apptMove', 'cal', 'weekplanAsk']) ui[k] = null;
+      'reviewSem', 'pdfReport', 'importNotes', 'parseError', 'parsing', 'apptForm', 'apptOpen', 'apptRef', 'apptDel', 'fw', 'check', 'anonConfirm', 'wipeConfirm', 'wipeMsg', 'apptMove', 'cal', 'weekplanAsk', 'occOpen', 'occEdit', 'occAdd', 'occAddOpen', 'lastRemoved']) ui[k] = null;
     ui.calOff = false; ui.calPreview = false; ui.semForm = false; ui.touched = false; ui.planKw = ''; ui.dismissed = new Set();
     this.conflicts = [];
   },
@@ -4055,12 +4168,75 @@ function courseRow(c) {
           <option value="" ${c.mandatory == null ? 'selected' : ''}>unklar</option><option value="1" ${c.mandatory === true ? 'selected' : ''}>ja</option><option value="0" ${c.mandatory === false ? 'selected' : ''}>nein</option></select></label>
         <span class="muted">${nEv} Termine</span>
       </div>
+      <div class="cline small">
+        <label class="row" style="gap:6px;flex:1;min-width:200px">Ort <input type="text" id="place-${c.id}" data-field="place" data-id="${c.id}" value="${esc(c.place || '')}" placeholder="z. B. Hörsaal N55, Martinistr. 52" style="flex:1;min-width:150px;max-width:360px"></label>
+        <button class="btn sm ${ui.occOpen === c.id ? 'primary' : ''}" data-act="occ-toggle" data-id="${c.id}">${ui.occOpen === c.id ? 'Termine schließen' : 'Termine ansehen & ändern'}</button>
+      </div>
+      ${ui.occOpen === c.id ? occPanel(c) : ''}
       ${gs.length > 1 ? `<div class="cline small"><span class="muted">${gs.length} Gruppen:</span>${gs.map(g => `<span class="chip">${esc(g.name)}</span>`).join('')}
         <span class="seg" role="group" aria-label="Gruppenmodus"><button data-act="gmode" data-id="${c.id}" data-v="alternative" aria-pressed="${c.groupMode === 'alternative'}">eine davon</button><button data-act="gmode" data-id="${c.id}" data-v="all" aria-pressed="${c.groupMode === 'all'}">alle</button></span></div>` : ''}
       ${warn ? `<div class="alert ${c.mandatory ? 'bad' : 'warn'}"><b>${c.mandatory ? 'Achtung: Diese Veranstaltung wurde als Pflichtveranstaltung markiert.' : 'Ob diese Veranstaltung Pflicht ist, steht nicht im PDF.'}</b>
         <span class="small">Wenn du ${esc(c.code)} abwählst, plane ich es nicht mehr ein.</span>
         <div class="row"><button class="btn sm" data-act="course-off-yes" data-id="${c.id}">Trotzdem abwählen</button><button class="btn sm primary" data-act="course-off-no">Beibehalten</button></div></div>` : ''}
     </div></div>`;
+}
+
+/* ---------- Einzeltermine eines Fachs: Ort je Termin, entfernen, wiederherstellen, hinzufügen ---------- */
+const fmtDay = (d) => d.toLocaleDateString('de-DE', { weekday: 'short', day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'UTC' });
+function occEditorHtml(eid, w, room) {
+  return `<div class="row small" style="gap:6px"><input type="text" id="occ-place-input" value="${esc(room || '')}" placeholder="Ort nur für diesen Termin" style="flex:1;min-width:150px">
+    <button class="btn sm primary" data-act="occ-place-save" data-eid="${eid}" data-w="${w}">Speichern</button><button class="btn sm ghost" data-act="occ-cancel">Abbrechen</button></div>`;
+}
+function occPanel(c) {
+  const occ = C.occurrencesOf(st, c.id), gs = C.groupsOf(st, c.id);
+  const removed = (st.occEdits || []).map((x, i) => ({ x, i })).filter(({ x }) => x.action === 'remove' && x.sem === c.semesterId && x.code === c.code);
+  const rows = occ.map(o => {
+    const k = o.e.id + ':' + o.w;
+    const tag = o.manual ? '<span class="pill sig">hinzugefügt</span>' : o.own && c.place && o.room !== c.place ? '<span class="pill">eigener Ort</span>' : '';
+    return `<div class="occ"><span class="mono">${esc(fmtDay(o.d))} · ${C.fmt(o.start)}–${C.fmt(o.end)}</span>${gs.length > 1 ? `<span class="muted">${esc(o.g.name || 'alle')}</span>` : ''}
+      <span>${o.room ? esc(o.room) : '<span class="muted">Ort unbekannt</span>'} ${tag}</span>
+      <span class="row" style="gap:4px"><button class="btn ghost sm" data-act="occ-place" data-eid="${o.e.id}" data-w="${o.w}">Ort</button><button class="btn ghost sm danger" data-act="occ-del" data-eid="${o.e.id}" data-w="${o.w}">Entfernen</button></span>
+      ${ui.occEdit === k ? `<div style="grid-column:1/-1">${occEditorHtml(o.e.id, o.w, o.room)}</div>` : ''}</div>`;
+  }).join('');
+  const f = ui.occAdd || {};
+  return `<div class="occpanel" id="occ-${c.id}">
+    <div class="small muted">${occ.length} Termine. „Ort“ ändert nur diesen einen Termin; „Entfernen“ nimmt nur diesen Tag heraus.</div>
+    <div class="occlist">${rows || '<p class="small muted">Keine Termine.</p>'}</div>
+    ${removed.length ? `<details class="small" open><summary>Entfernt (${removed.length})</summary>${removed.map(({ x, i }) => `<div class="occ"><span class="mono">${esc(fmtDay(new Date(x.date + 'T00:00:00Z')))} · ${C.fmt(x.start)}–${C.fmt(x.end)}</span><span></span><span></span><button class="btn ghost sm" data-act="occ-restore" data-i="${i}">Wiederherstellen</button></div>`).join('')}</details>` : ''}
+    <details class="small"${ui.occAddOpen === c.id ? ' open' : ''}><summary>+ Termin hinzufügen</summary>
+      <div class="row" style="margin-top:6px">
+        <label class="field">Datum<input type="date" id="oa-date" value="${esc(f.date || '')}"></label>
+        <label class="field">Beginn<input type="time" id="oa-start" value="${esc(f.start || '')}"></label>
+        <label class="field">Ende<input type="time" id="oa-end" value="${esc(f.end || '')}"></label>
+        <label class="field" style="flex:1;min-width:140px">Ort<input type="text" id="oa-room" value="${esc(f.room || c.place || '')}"></label>
+        <label class="field">wöchentlich bis (optional)<input type="date" id="oa-until" value="${esc(f.until || '')}"></label>
+        ${gs.length > 1 ? `<label class="field">Gruppe<select id="oa-group">${gs.map(g => `<option value="${g.id}">${esc(g.name || 'alle')}</option>`).join('')}</select></label>` : ''}
+      </div>
+      <div class="row"><button class="btn sm primary" data-act="occ-add" data-id="${c.id}">Hinzufügen</button></div></details>
+  </div>`;
+}
+function onOccClick(act, a) {
+  const eid = a.dataset.eid, w = +a.dataset.w;
+  switch (act) {
+    case 'occ-toggle': if (a.dataset.go) { ui.tab = a.dataset.go; ui.occOpen = a.dataset.id; ui.occEdit = null; render(); const el = document.getElementById('occ-' + a.dataset.id); el && el.scrollIntoView({ behavior: 'smooth', block: 'start' }); return true; }
+      ui.occOpen = ui.occOpen === a.dataset.id ? null : a.dataset.id; ui.occEdit = null; render(); return true;
+    case 'occ-place': ui.occEdit = eid + ':' + w; render(); { const el = $('#occ-place-input'); el && el.focus(); } return true;
+    case 'occ-cancel': ui.occEdit = null; render(); return true;
+    case 'occ-place-save': { const v = ($('#occ-place-input') || {}).value || ''; C.setOccPlace(st, eid, w, v); ui.occEdit = null; changed(); render(); toast(v.trim() ? `Ort nur für diesen Termin: ${v.trim()}` : 'Eigener Ort entfernt – es gilt wieder der Ort des Fachs.'); return true; }
+    case 'occ-del': { const rec = C.removeOcc(st, eid, w); ui.occEdit = null; ui.lastRemoved = rec; changed(); render(); toast('Termin entfernt – unter „Fächer › Termine“ wiederherstellbar.'); return true; }
+    case 'occ-undo': { const rec = ui.lastRemoved; const i = (st.occEdits || []).indexOf((st.occEdits || []).find(x => rec && x.sem === rec.sem && x.code === rec.code && x.date === rec.date && x.start === rec.start && x.action === 'remove')); if (i >= 0) C.restoreOcc(st, st.occEdits[i]); ui.lastRemoved = null; changed(); render(); toast('Wiederhergestellt.'); return true; }
+    case 'occ-restore': { const rec = (st.occEdits || [])[+a.dataset.i]; if (rec && C.restoreOcc(st, rec)) { changed(); render(); toast('Termin wiederhergestellt.'); } return true; }
+    case 'occ-add': {
+      const c = courseById(a.dataset.id); const val = (id) => ($(id) || {}).value || '';
+      const f = { date: val('#oa-date'), start: val('#oa-start'), end: val('#oa-end'), room: val('#oa-room'), until: val('#oa-until') };
+      ui.occAdd = f; ui.occAddOpen = c.id;
+      const s0 = C.toMin(f.start), e0 = C.toMin(f.end);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(f.date) || s0 == null || e0 == null || e0 <= s0) { toast('Bitte Datum, Beginn und Ende eingeben (Ende nach Beginn).'); render(); return true; }
+      if (f.until && f.until < f.date) { toast('„wöchentlich bis“ liegt vor dem Datum.'); render(); return true; }
+      const e = C.addOcc(st, c.id, { groupId: val('#oa-group') || null, date: f.date, start: s0, end: e0, room: f.room, until: f.until });
+      ui.occAdd = null; ui.occAddOpen = null; changed(); render(); toast(`${e.weeks.length === 1 ? 'Termin' : e.weeks.length + ' Termine'} hinzugefügt.`); return true; }
+  }
+  return false;
 }
 
 /* =================== WÜNSCHE =================== */
@@ -4620,13 +4796,43 @@ function weekplanImport() {
   const ext = $('#wp-extend') ? $('#wp-extend').checked : true;
   const conv = WeekGridParser.toEvents(a.res.weekplan, g, sk, { extend: ext });
   const res = { events: conv.events, warnings: conv.warnings, meta: { ...a.res.meta, code: '', semesterNumber: a.semNo || a.res.meta.semesterNumber }, method: ['wochenplan'] };
+  let keep = null;
   if (a.semId) { // Kursgruppe ändern: bisherige Fächer dieses Semesters ersetzen
     const cids = st.courses.filter(c => c.semesterId === a.semId).map(c => c.id), gids = st.groups.filter(x => cids.includes(x.courseId)).map(x => x.id);
+    // deine Ergänzungen merken: Ort je Fach und selbst hinzugefügte Termine
+    keep = { places: {}, manual: [], fixed: [] };
+    // von dir geprüfte/korrigierte Termine (z. B. fehlendes Ende eingetragen)
+    st.events.filter(e => gids.includes(e.groupId) && !e.manual && e.confirmed).forEach(e => { const g = groupById(e.groupId), c = courseById(g.courseId); keep.fixed.push({ code: c.code, gname: g.name, weekday: e.weekday, start: e.start, weeksRaw: e.weeksRaw, end: e.end, room: e.room, instructor: e.instructor }); });
+    st.courses.filter(c => c.semesterId === a.semId && c.place).forEach(c => { keep.places[c.code] = c.place; });
+    st.events.filter(e => gids.includes(e.groupId) && e.manual).forEach(e => { const g = groupById(e.groupId), c = courseById(g.courseId); keep.manual.push({ code: c.code, name: c.name, gname: g.name, e: JSON.parse(JSON.stringify(e)) }); });
     st.events = st.events.filter(e => !gids.includes(e.groupId)); st.groups = st.groups.filter(x => !cids.includes(x.courseId)); st.courses = st.courses.filter(c => c.semesterId !== a.semId);
     const s0 = semById(a.semId); if (s0) s0.files = [];
     ui.plan = null; ui.results = null;
   }
   const sem = importResult(res, a.file, a.target, a.semId);
+  // SkillsLab ohne bekannte Gruppe: ist ausgeschaltet, beide Zeiten sind Wahl – keine blockierende Rückfrage dazu
+  st.courses.filter(c => c.semesterId === sem.id && c.active === false).forEach(c => { c.groupsConfirmed = true; c.groupMode = 'alternative'; });
+  if (keep) {
+    st.courses.filter(c => c.semesterId === sem.id && keep.places[c.code]).forEach(c => { c.place = keep.places[c.code]; });
+    for (const f of keep.fixed) {
+      const c = st.courses.find(x => x.semesterId === sem.id && x.code === f.code); if (!c) continue;
+      const gids2 = C.groupsOf(st, c.id).filter(g => g.name === f.gname).map(g => g.id);
+      const e = st.events.find(x => gids2.includes(x.groupId) && x.weekday === f.weekday && x.start === f.start && x.weeksRaw === f.weeksRaw); if (!e) continue;
+      if (e.end == null && f.end != null) { e.end = f.end; e.timeSure = true; }
+      if (!e.room && f.room) e.room = f.room;
+      if (!e.instructor && f.instructor) e.instructor = f.instructor;
+      e.confirmed = true;
+    }
+    for (const m of keep.manual) {
+      let c = st.courses.find(x => x.semesterId === sem.id && x.code === m.code);
+      if (!c) { c = { id: C.uid('c'), semesterId: sem.id, code: m.code, name: m.name || m.code, type: 'unklar', typeConfirmed: false, mandatory: null, active: true, groupMode: 'alternative', groupsConfirmed: true }; st.courses.push(c); }
+      let g = C.groupsOf(st, c.id).find(x => x.name === m.gname) || C.groupsOf(st, c.id)[0];
+      if (!g) { g = { id: C.uid('g'), courseId: c.id, name: m.gname || '' }; st.groups.push(g); }
+      st.events.push({ ...m.e, id: C.uid('e'), groupId: g.id });
+    }
+  }
+  const nEd = C.applyOccEdits(st, sem.id);
+  if (nEd && ui.importNotes) ui.importNotes.list.unshift(`${nEd} von dir geänderte Einzeltermine (Ort/entfernt) wieder angewendet.`);
   // gelesene Einträge behalten (ohne Rohtext), damit die Kursgruppe später ohne PDF geändert werden kann
   sem.weekplan = { file: a.file, group: g, skills: sk, extend: ext, data: { weeks: a.res.weekplan.weeks.map(w => ({ weekNo: w.weekNo, cohort: w.cohort })), notes: a.res.weekplan.notes, warnings: a.res.weekplan.warnings, meta: a.res.weekplan.meta,
     entries: a.res.weekplan.entries.map(e => { const { src, weekLabel, page, timeSet, ...rest } = e; return rest; }) } };
@@ -4672,6 +4878,7 @@ async function onClick(ev) {
   if (a.tagName === 'A') ev.preventDefault();
   if (/^(ap|fw)-/.test(act) && onApptClick(act, a)) return;
   if (/^cal-(view|nav|today|day)$/.test(act) && onCalClick(act, a)) return;
+  if (/^occ-/.test(act) && onOccClick(act, a)) return;
   if (/^(acct|cfg)-/.test(act)) { await onAcctClick(act, id); return; }
   if (a.tagName === 'SELECT' || (a.tagName === 'INPUT' && a.type !== 'checkbox')) return;
   if (a.tagName === 'INPUT' && a.type === 'checkbox') return; // über change
@@ -4696,6 +4903,7 @@ async function onClick(ev) {
       const gids = st.groups.filter(g => cids.includes(g.courseId)).map(g => g.id);
       st.events = st.events.filter(e => !gids.includes(e.groupId)); st.groups = st.groups.filter(g => !cids.includes(g.courseId));
       st.courses = st.courses.filter(c => c.semesterId !== id); st.semesters = st.semesters.filter(s => s.id !== id);
+      st.occEdits = (st.occEdits || []).filter(x => x.sem !== id);
       if (ui.reviewSem === id) ui.reviewSem = null; ui.confirmDelete = null; ui.plan = null; changed(); render(); break;
     }
     case 'grp-yes': case 'grp-all': { const c = courseById(id); c.groupsConfirmed = true; c.groupMode = act === 'grp-yes' ? 'alternative' : 'all'; changed(); render(); break; }
@@ -4809,6 +5017,7 @@ function onChange(ev) {
     if (f === 'name') c.name = t.value.trim() || c.code;
     if (f === 'type') { c.type = t.value; c.typeConfirmed = true; }
     if (f === 'mandatory') c.mandatory = t.value === '' ? null : t.value === '1';
+    if (f === 'place') { c.place = t.value.trim(); toast(c.place ? `Ort für alle Termine von ${c.code} ohne eigenen Ort: ${c.place}` : 'Ort entfernt.'); }
     changed(); render(); return;
   }
   if (t.dataset.weight) { st.prefs.weights[t.dataset.weight] = +t.value; changed(); renderTabs(); return; }
@@ -4824,6 +5033,7 @@ document.addEventListener('input', (ev) => {
   const t = ev.target;
   if (t.tagName !== 'SELECT' && t.type !== 'checkbox') { try { if (onApptInput(t)) return; } catch (e) { reportError(e, 'Eingabe'); render(); return; } }
   if (t.dataset.weight) { const o = $('#wo-' + t.dataset.weight); if (o) o.textContent = t.value; }
+  if (/^oa-/.test(t.id)) { ui.occAdd = ui.occAdd || {}; ui.occAdd[t.id.slice(3)] = t.value; return; } // Eingaben merken, falls neu gezeichnet wird
   if (t.id === 'ev-weeks') { const p = $('#ev-weeks-prev'); const ev = st.events.find(x => x.id === ui.editEvent); if (p) p.innerHTML = weeksPreview(C.parseWeeks(t.value, ev && semOfEvent(ev)), ev && semOfEvent(ev)); }
 });
 function afterRender() {
