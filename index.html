@@ -10,7 +10,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-<script>window.SPO_VERSION = {"name": "1.7.1", "build": "0cb29ca865", "date": "20.10.2026 11:28"};</script>
+<script>window.SPO_VERSION = {"name": "1.7.2", "build": "4f3e05582f", "date": "21.10.2026 08:25"};</script>
 <script src="config.js"></script>
 <title>Stundenplan-Optimierer</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -660,7 +660,7 @@ const WeekGridParser = (() => {
     return lines.sort((a, b) => a.top - b.top).map(l => l.items.sort((a, b) => a.x - b.x).map(i => i.str).join(' ').replace(/\s+/g, ' ').trim());
   }
 
-  function parse(pages) {
+  function parse(pages, opts = {}) {
     const weeks = [], entries = [], warnings = [], notes = [], meta = {};
     const dates = [], holidays = new Set();
     pages.forEach((p, pi) => {
@@ -752,7 +752,36 @@ const WeekGridParser = (() => {
           const box = { x0: cols[cs[0]].x0, x1: cols[cs[cs.length - 1]].x1, y0: rows[rs[0]].y0, y1: rows[rs[rs.length - 1]].y1 };
           const its = gridItems.filter(i => { const cx = i.x + Math.min(i.w || 0, H * 2) / 2, cy = i.top + i.h / 2; return cx >= box.x0 && cx < box.x1 && cy > box.y0 && cy < box.y1; });
           return { rs, cs, box, lines: textLines(its, tol), start: rows[rs[0]].start, end: rows[rs[rs.length - 1]].end };
-        }).filter(rg => rg.lines.length);
+        });
+        if (opts.cells) weeks[weeks.length - 1].cells = regs.map(rg => ({ page: g.page, rs: rg.rs, cs: rg.cs, box: rg.box, text: rg.lines.join(' ') }));
+        const regs0 = regs.slice(); const regsT = regs0.filter(rg => rg.lines.length); regs.length = 0; regs.push(...regsT);
+        // Hintergrundfarbe einer Zelle (zuletzt gezeichnete Fläche, die die Zelle abdeckt – keine Schrift, kein Seitenhintergrund)
+        const gw = cols[Cn - 1].x1 - cols[0].x0;
+        const colorAt = (r, c) => {
+          const cx = (cols[c].x0 + cols[c].x1) / 2, cy = (rows[r].y0 + rows[r].y1) / 2, cw = cols[c].x1 - cols[c].x0, rh = rows[r].y1 - rows[r].y0;
+          const hit = (p.fills || []).filter(f => f.x0 <= cx && f.x1 >= cx && f.y0 <= cy && f.y1 >= cy && (f.x1 - f.x0) >= cw * 0.6 && (f.y1 - f.y0) >= rh * 0.3 && (f.x1 - f.x0) <= gw * 1.05);
+          return hit.length ? String(hit[hit.length - 1].fill).toLowerCase() : null;
+        };
+        // Leere Zellen in derselben Farbe direkt über/unter einer beschrifteten Zelle gehören zu dieser Veranstaltung
+        // (z. B. „Vorlesungen Modul Niere“ 11:30–13:00, darunter leer und gleichfarbig 14:00–15:30 und 15:45–17:15).
+        // Jede Zeile bleibt ein eigener Block, damit die Pausen sichtbar bleibt. Abschaltbar (toEvents: extend = false).
+        const regOf = (r, c) => regs0.find(rg => rg.rs.includes(r) && rg.cs.includes(c));
+        const claimed = new Set();
+        regs0.forEach(rg => { if (rg.lines.length) rg.rs.forEach(r => rg.cs.forEach(c => claimed.add(r * Cn + c))); });
+        for (const rg of regs) {
+          rg.ext = [];
+          if (/Skills?lab/i.test(rg.lines.join(' '))) continue; // eigene Zeiten im Text
+          for (const c of rg.cs) {
+            const walk = (from, step) => {
+              const base = colorAt(from, c); if (!base) return;
+              for (let r = from + step; r >= 0 && r < R; r += step) {
+                const o = regOf(r, c); if (!o || o.lines.length || claimed.has(r * Cn + c) || colorAt(r, c) !== base) break;
+                claimed.add(r * Cn + c); rg.ext.push({ r, c });
+              }
+            };
+            walk(rg.rs[rg.rs.length - 1], 1); walk(rg.rs[0], -1);
+          }
+        }
         // Modul-Zuordnung dieser Woche („Gruppe 1: Herz  Gruppe 3: Lunge …“)
         const assign = {};
         for (const rg of regs) {
@@ -768,11 +797,17 @@ const WeekGridParser = (() => {
             if (rg.assign) {
               // die Zuordnungszelle selbst ist ein Modul-Termin der genannten Gruppen
               entries.push({ ...base, title: 'Module', kind: 'module', cohorts: Object.keys(assign).map(Number), start: rg.start, end: rg.end, assign, src: rg.lines.join(' ') });
+              for (const x of rg.ext.filter(x => x.c === c)) entries.push({ ...base, title: 'Module', kind: 'module', cohorts: Object.keys(assign).map(Number), start: rows[x.r].start, end: rows[x.r].end, assign, ext: true });
               continue;
             }
-            for (const e of cellEntries(rg.lines, rg.start, rg.end, cols, col)) {
+            const made = cellEntries(rg.lines, rg.start, rg.end, cols, col);
+            for (const e of made) {
               if (e.kind === 'module') { e.cohorts = Object.keys(assign).length ? Object.keys(assign).map(Number) : null; e.assign = assign; }
               entries.push({ ...base, ...e, weekday: e.weekday ?? col.wd, date: e.date || base.date });
+            }
+            for (const x of rg.ext.filter(x => x.c === c)) for (const e of made) {
+              if (e.timeSet || e.kind === 'skills' || e.kind === 'digi') continue;
+              entries.push({ ...base, ...e, start: rows[x.r].start, end: rows[x.r].end, ext: true });
             }
           }
         }
@@ -865,7 +900,8 @@ const WeekGridParser = (() => {
    * Für eine Kursgruppe (und optional SkillsLab-Gruppe) die Termine bilden – im Format des Listen-Lesers.
    * group: Nummer der Kursgruppe; skills: 1 | 2 | null (unbekannt → beide als Wahlmöglichkeit, Fach ausgeschaltet)
    */
-  function toEvents(wp, group, skills) {
+  function toEvents(wp, group, skills, opts = {}) {
+    const extend = opts.extend !== false;
     const warnings = [], byKey = new Map(), seenAssign = new Set();
     const mine = (e) => {
       if (e.kind === 'skills') return skills == null || e.skillsGroup === skills;
@@ -874,6 +910,7 @@ const WeekGridParser = (() => {
     };
     for (const e of wp.entries) {
       if (e.kind === 'skills' && e.gridCohort && !e.gridCohort.includes(group)) continue; // steht im Raster der anderen Hälfte
+      if (e.ext && !extend) continue;
       if (!mine(e)) continue;
       if (e.weeksOnly && (e.weekNo < e.weeksOnly[0] || e.weekNo > e.weeksOnly[1])) continue;
       if (!e.date) continue;
@@ -898,6 +935,7 @@ const WeekGridParser = (() => {
     const digi = events.filter(e => e.end == null);
     if (digi.length) warnings.push({ text: `Skillslab Digitalisierungskurs: Tag und Beginn stehen im PDF, das Ende nicht – bitte bei der Prüfung eintragen (${digi.length} Termin${digi.length > 1 ? 'e' : ''}).` });
     if (wp.entries.some(e => e.kind === 'module' && e.assign && Object.keys(e.assign).length)) warnings.push({ text: '„Module“: zugeordnet nach „Gruppe X: Thema“ im jeweiligen Wochenraster – nur die dort genannten Gruppen haben in dieser Woche Module. Bitte prüfen.' });
+    if (extend && wp.entries.some(e => e.ext)) warnings.push({ text: 'Leere Felder in derselben Farbe direkt über oder unter einer Veranstaltung habe ich dieser zugeordnet (z. B. „Vorlesungen Modul Niere“ auch 14:00–15:30 und 15:45–17:15). Jeder Block steht einzeln, die Pausen bleiben frei. Abschaltbar über „Kursgruppe ändern“.' });
     for (const n of wp.notes || []) warnings.push({ text: 'Hinweis im PDF: ' + n });
     for (const w of wp.warnings || []) warnings.push(w);
     return { events, warnings, meta: wp.meta };
@@ -993,7 +1031,7 @@ const SPParser = (() => {
     let ctm = [1, 0, 0, 1, 0, 0]; const stack = [];
     let fill = null;
     const isPaint = (op) => [ops.fill, ops.eoFill, ops.fillStroke, ops.eoFillStroke, ops.closeFillStroke, ops.closeEOFillStroke, ops.stroke, ops.closeStroke].includes(op);
-    const isFill = (op) => op !== ops.stroke && op !== ops.closeStroke;
+    const isFill = (op) => [ops.fill, ops.eoFill, ops.fillStroke, ops.eoFillStroke, ops.closeFillStroke, ops.closeEOFillStroke].includes(op); // nur gefüllte Flächen, keine Beschneidungspfade (clip)
     for (let i = 0; i < ol.fnArray.length; i++) {
       const fn = ol.fnArray[i], a = ol.argsArray[i];
       if (fn === ops.save) stack.push(ctm);
@@ -1087,7 +1125,7 @@ const SPParser = (() => {
         pageTexts.push(items.map(i => ({ str: i.str, x: i.x, rx: i.x / vp.width, top: i.top, h: i.h })));
       } catch (e) { throw stageError(`Text auf Seite ${n} lesen`, e); }
       try { shapes = await extractShapes(lib, page, vp); } catch (e) { log.push(`Seite ${n}: Rechtecke nicht lesbar – ${e.message}`); }
-      pageGeo.push({ items, lines: shapes.thin || [], W: vp.width, H: vp.height });
+      pageGeo.push({ items, lines: shapes.thin || [], fills: shapes.filter(x => x.fill), W: vp.width, H: vp.height });
       let px = null;
       const getPx = async () => {
         if (px || !canRender) return px;
@@ -4572,13 +4610,15 @@ function weekplanAskHtml() {
       <label class="field">Deine Kursgruppe<select id="wp-group"><option value="">bitte wählen</option>${Array.from({ length: max }, (_, i) => i + 1).map(n => `<option value="${n}" ${cur && cur.group === n ? 'selected' : ''}>Gruppe ${n}</option>`).join('')}</select></label>
       ${hasSkills ? `<label class="field">SkillsLab-Gruppe<select id="wp-skills"><option value="">weiß ich nicht</option><option value="1" ${cur && cur.skills === 1 ? 'selected' : ''}>Gruppe 1 (vormittags)</option><option value="2" ${cur && cur.skills === 2 ? 'selected' : ''}>Gruppe 2 (nachmittags)</option></select></label>` : ''}
     </div>
+    ${wp.entries.some(e => e.ext) ? `<label class="row small" style="gap:6px"><input type="checkbox" id="wp-extend" ${!cur || cur.extend !== false ? 'checked' : ''}> Leere Felder in derselben Farbe direkt über/unter einer Vorlesung gehören dazu (z. B. Modul Niere bis 17:15, Pausen bleiben frei)</label>` : ''}
     <div class="row"><button class="btn primary" data-act="wp-yes">Übernehmen</button><button class="btn" data-act="wp-no">Abbrechen</button></div></div>`;
 }
 function weekplanImport() {
   const a = ui.weekplanAsk; if (!a) return;
   const g = +($('#wp-group') || {}).value; if (!g) { toast('Bitte zuerst deine Kursgruppe wählen.'); return; }
   const sv = $('#wp-skills') ? $('#wp-skills').value : ''; const sk = sv ? +sv : null;
-  const conv = WeekGridParser.toEvents(a.res.weekplan, g, sk);
+  const ext = $('#wp-extend') ? $('#wp-extend').checked : true;
+  const conv = WeekGridParser.toEvents(a.res.weekplan, g, sk, { extend: ext });
   const res = { events: conv.events, warnings: conv.warnings, meta: { ...a.res.meta, code: '', semesterNumber: a.semNo || a.res.meta.semesterNumber }, method: ['wochenplan'] };
   if (a.semId) { // Kursgruppe ändern: bisherige Fächer dieses Semesters ersetzen
     const cids = st.courses.filter(c => c.semesterId === a.semId).map(c => c.id), gids = st.groups.filter(x => cids.includes(x.courseId)).map(x => x.id);
@@ -4588,7 +4628,7 @@ function weekplanImport() {
   }
   const sem = importResult(res, a.file, a.target, a.semId);
   // gelesene Einträge behalten (ohne Rohtext), damit die Kursgruppe später ohne PDF geändert werden kann
-  sem.weekplan = { file: a.file, group: g, skills: sk, data: { weeks: a.res.weekplan.weeks.map(w => ({ weekNo: w.weekNo, cohort: w.cohort })), notes: a.res.weekplan.notes, warnings: a.res.weekplan.warnings, meta: a.res.weekplan.meta,
+  sem.weekplan = { file: a.file, group: g, skills: sk, extend: ext, data: { weeks: a.res.weekplan.weeks.map(w => ({ weekNo: w.weekNo, cohort: w.cohort })), notes: a.res.weekplan.notes, warnings: a.res.weekplan.warnings, meta: a.res.weekplan.meta,
     entries: a.res.weekplan.entries.map(e => { const { src, weekLabel, page, timeSet, ...rest } = e; return rest; }) } };
   ui.weekplanAsk = null; changed(); render();
 }
